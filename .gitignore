@@ -1,0 +1,10 @@
+backend/venv/
+backend/uploads/*
+!backend/uploads/.gitkeep
+__pycache__/
+*.pyc
+*.pyo
+.env
+.DS_Store
+*.slx
+*.mdl

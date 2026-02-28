@@ -1,0 +1,10 @@
+flask
+flask-cors
+pymupdf
+opencv-python-headless
+pytesseract
+pillow
+lxml
+numpy
+python-dotenv
+gunicorn

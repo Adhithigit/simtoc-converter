@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>SimToC — Simulink to C Converter</title>
+    <link rel="stylesheet" href="style.css"/>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css"/>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+</head>
+<body>
+
+<canvas id="particle-canvas"></canvas>
+<div class="bg-grid"></div>
+
+<header class="header">
+    <div class="logo">
+        <div class="logo-icon">⚡</div>
+        <div>
+            <span class="logo-main">SimToC</span>
+            <span class="logo-sub">Simulink → C Code Converter</span>
+        </div>
+    </div>
+    <div class="status-bar">
+        <div class="status-dot" id="status-dot"></div>
+        <span id="status-text">Connecting...</span>
+    </div>
+</header>
+
+<main class="layout">
+
+    <!-- LEFT: Upload Panel -->
+    <section class="panel upload-panel">
+        <div class="panel-header">
+            <span>📁</span><h2>Upload File</h2>
+        </div>
+
+        <div class="upload-zone" id="upload-zone">
+            <div class="upload-icon">🔬</div>
+            <p class="upload-title">Drop your file here</p>
+            <p class="upload-sub">SLX · MDL · PDF · PNG · JPG</p>
+            <input type="file" id="file-input" accept=".slx,.mdl,.pdf,.png,.jpg,.jpeg,.bmp" hidden/>
+            <button class="btn btn-outline" onclick="document.getElementById('file-input').click()">Browse</button>
+        </div>
+
+        <div class="file-badge-wrap" id="file-badge-wrap" style="display:none">
+            <div class="file-badge">
+                <span id="file-icon-display">📄</span>
+                <div>
+                    <div id="file-name-display" class="fname"></div>
+                    <div id="file-size-display" class="fsize"></div>
+                </div>
+                <button class="remove-btn" onclick="removeFile()">✕</button>
+            </div>
+        </div>
+
+        <button class="btn btn-primary convert-btn" id="convert-btn" onclick="startConvert()" disabled>
+            <span>⚡</span> Convert to C
+        </button>
+
+        <div class="stats-grid" id="stats-grid" style="display:none">
+            <div class="stat"><div class="stat-val" id="s-blocks">0</div><div class="stat-lbl">Blocks</div></div>
+            <div class="stat"><div class="stat-val" id="s-conns">0</div><div class="stat-lbl">Connections</div></div>
+            <div class="stat"><div class="stat-val" id="s-lines">0</div><div class="stat-lbl">Lines of C</div></div>
+        </div>
+    </section>
+
+    <!-- RIGHT -->
+    <div class="right-col">
+
+        <!-- Diagram -->
+        <section class="panel">
+            <div class="panel-header">
+                <span>🔗</span><h2>Block Diagram</h2>
+                <button class="btn btn-sm" style="margin-left:auto" onclick="resetZoom()">Reset View</button>
+            </div>
+            <div class="diagram-wrap" id="diagram-wrap">
+                <div class="placeholder" id="diag-placeholder">
+                    <div style="font-size:2.5rem;opacity:.4">🧩</div>
+                    <p>Block diagram appears here after conversion</p>
+                </div>
+                <svg id="diag-svg" style="display:none;width:100%;height:100%"></svg>
+            </div>
+        </section>
+
+        <!-- Code Output -->
+        <section class="panel code-section">
+            <div class="panel-header">
+                <span>💻</span><h2>Generated C Code</h2>
+                <div style="margin-left:auto;display:flex;gap:8px">
+                    <button class="btn btn-sm" id="copy-btn" onclick="copyCode()" style="display:none">Copy</button>
+                    <button class="btn btn-sm btn-green" id="dl-btn" onclick="openDownload()" style="display:none">⬇ Download</button>
+                </div>
+            </div>
+            <div class="code-wrap">
+                <div class="placeholder" id="code-placeholder">
+                    <div style="font-size:2.5rem;opacity:.4">⚙️</div>
+                    <p>Your C code will appear here</p>
+                </div>
+                <pre id="code-pre" style="display:none"><code class="language-c" id="code-el"></code></pre>
+            </div>
+        </section>
+
+    </div>
+</main>
+
+<!-- Loading -->
+<div class="overlay" id="loading" style="display:none">
+    <div class="loading-box">
+        <div class="spinner"></div>
+        <div class="loading-title">Converting...</div>
+        <div class="loading-sub" id="loading-sub">Parsing block diagram</div>
+    </div>
+</div>
+
+<!-- Download Modal -->
+<div class="overlay" id="dl-modal" style="display:none">
+    <div class="modal">
+        <div class="modal-head">
+            <h3>💾 Download C Code</h3>
+            <button class="remove-btn" onclick="closeDownload()">✕</button>
+        </div>
+        <div class="modal-body">
+            <label class="lbl">File Name</label>
+            <input class="inp" id="dl-name" value="model_output.c"/>
+
+            <label class="lbl">Quick Names</label>
+            <div class="presets">
+                <button class="preset" onclick="setName('model_step.c')">model_step.c</button>
+                <button class="preset" onclick="setName('controller.c')">controller.c</button>
+                <button class="preset" onclick="setName('simulink_export.c')">simulink_export.c</button>
+            </div>
+
+            <p class="hint">💡 Your browser will ask where to save the file when you click Download.</p>
+        </div>
+        <div class="modal-foot">
+            <button class="btn btn-outline" onclick="closeDownload()">Cancel</button>
+            <button class="btn btn-primary" onclick="doDownload()">Download File</button>
+        </div>
+    </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script src="script.js"></script>
+</body>
+</html>
