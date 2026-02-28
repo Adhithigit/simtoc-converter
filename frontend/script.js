@@ -2,7 +2,7 @@
 // SimToC — Frontend Script
 // =========================================
 
-const API = 'http://localhost:8080'; 
+const API = 'https://simtoc-converter.onrender.com';
 // When running locally change above to: 'http://localhost:8080'
 
 let currentCode = '';
