@@ -12,82 +12,168 @@ def parse_mdl(filepath):
     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
         content = f.read()
 
-    # ---- Parse Blocks ----
-    block_pattern = re.compile(r'Block\s*\{(.*?)\n\s*\}', re.DOTALL)
+    content = content.replace('\r\n', '\n').replace('\r', '\n')
 
-    for match in block_pattern.finditer(content):
-        bc = match.group(1)
+    # Build name->id map after parsing
+    _parse_all_blocks(content, blocks, connections, counter)
+
+    # Build name -> id lookup
+    name_to_id = {}
+    for b in blocks:
+        name_to_id[b['name']] = b['id']
+        name_to_id[b['name'].strip()] = b['id']
+
+    # Resolve name-based connections to ID-based
+    resolved = []
+    for c in connections:
+        src = str(c.get('from', '')).strip()
+        dst = str(c.get('to', '')).strip()
+
+        if not src.isdigit():
+            src = str(name_to_id.get(src, src))
+        if not dst.isdigit():
+            dst = str(name_to_id.get(dst, dst))
+
+        if src and dst and src != dst and src.isdigit() and dst.isdigit():
+            resolved.append({'from': src, 'to': dst})
+
+    return blocks, resolved
+
+
+def _parse_all_blocks(content, blocks, connections, counter):
+    def nid():
+        counter[0] += 1
+        return str(counter[0])
+
+    # Find all Block sections using regex
+    # Match Block { ... } at any nesting level
+    pos = 0
+    while pos < len(content):
+        m = re.search(r'\bBlock\s*\{', content[pos:])
+        if not m:
+            break
+
+        abs_start = pos + m.start()
+        brace_open = pos + m.end() - 1
+
+        # Extract content between braces
+        bc = _get_brace_content(content, brace_open)
+        if bc is None:
+            pos = abs_start + 1
+            continue
+
         block_type = _val(bc, 'BlockType')
         block_name = _val(bc, 'Name')
         pos_str    = _val(bc, 'Position')
 
-        if not block_type:
-            continue
+        if block_type:
+            block_type = block_type.strip().strip('"')
+            block_type = _normalize(block_type)
 
-        x, y = 0.0, 0.0
-        if pos_str:
-            nums = re.findall(r'[-\d.]+', pos_str)
-            if len(nums) >= 2:
-                try:
-                    x = float(nums[0])
-                    y = float(nums[1])
-                except:
-                    pass
+            x, y = 0.0, 0.0
+            if pos_str:
+                nums = re.findall(r'[-\d.]+', pos_str)
+                if len(nums) >= 2:
+                    try:
+                        x, y = float(nums[0]), float(nums[1])
+                    except:
+                        pass
 
-        params = {}
-        for line in bc.split('\n'):
-            line = line.strip()
-            if not line or line.startswith('//'):
-                continue
-            parts = line.split(None, 1)
-            if len(parts) == 2:
-                key = parts[0].strip()
-                val = parts[1].strip().strip('"')
-                if key not in ('BlockType', 'Name', 'Position'):
-                    params[key] = val
+            params = {}
+            for line in bc.split('\n'):
+                line = line.strip()
+                if not line or '{' in line or '}' in line:
+                    continue
+                parts = line.split(None, 1)
+                if len(parts) == 2:
+                    k = parts[0].strip()
+                    v = parts[1].strip().strip('"')
+                    params[k] = v
 
-        bid = nid()
-        blocks.append({
-            'id':     bid,
-            'type':   block_type,
-            'name':   block_name or f'Block_{bid}',
-            'x':      x,
-            'y':      y,
-            'params': params
-        })
+            bid = nid()
+            bname = (block_name or f'Block_{bid}').strip().strip('"')
 
-    # ---- Build name → id map ----
-    name_to_id = {b['name']: b['id'] for b in blocks}
+            blocks.append({
+                'id':     bid,
+                'type':   block_type,
+                'name':   bname,
+                'x':      x,
+                'y':      y,
+                'params': params
+            })
 
-    # ---- Parse Line connections ----
-    line_pattern = re.compile(r'Line\s*\{(.*?)\n\s*\}', re.DOTALL)
+        pos = abs_start + len(bc) + 2
+        if pos <= abs_start:
+            pos = abs_start + 1
 
-    for match in line_pattern.finditer(content):
-        lc = match.group(1)
-        src_name = _val(lc, 'SrcBlock')
-        dst_name = _val(lc, 'DstBlock')
+    # Parse Line connections
+    for lm in re.finditer(r'\bLine\s*\{(.*?)\n[ \t]*\}', content, re.DOTALL):
+        lc = lm.group(1)
+        src = _val(lc, 'SrcBlock')
+        dst = _val(lc, 'DstBlock')
+        if src and dst:
+            connections.append({'from': src.strip(), 'to': dst.strip()})
 
-        if src_name and dst_name:
-            src_id = name_to_id.get(src_name)
-            dst_id = name_to_id.get(dst_name)
+        # Branch connections
+        for bm in re.finditer(r'Branch\s*\{(.*?)\}', lc, re.DOTALL):
+            dst2 = _val(bm.group(1), 'DstBlock')
+            if src and dst2:
+                connections.append({'from': src.strip(), 'to': dst2.strip()})
 
-            if src_id and dst_id:
-                connections.append({'from': src_id, 'to': dst_id})
 
-        # Handle branch connections (one source to multiple destinations)
-        branch_pattern = re.compile(r'Branch\s*\{(.*?)\}', re.DOTALL)
-        for branch in branch_pattern.finditer(lc):
-            bc2 = branch.group(1)
-            dst_name2 = _val(bc2, 'DstBlock')
-            if src_name and dst_name2:
-                src_id  = name_to_id.get(src_name)
-                dst_id2 = name_to_id.get(dst_name2)
-                if src_id and dst_id2:
-                    connections.append({'from': src_id, 'to': dst_id2})
+def _get_brace_content(content, start):
+    if start >= len(content) or content[start] != '{':
+        return None
+    depth = 0
+    for i in range(start, min(start + 50000, len(content))):
+        if content[i] == '{':
+            depth += 1
+        elif content[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return content[start+1:i]
+    return None
 
-    return blocks, connections
+
+def _normalize(btype):
+    m = {
+        'S-Function': 'SFunction', 'S-function': 'SFunction',
+        'ComplexToRealImag': 'ComplexToRealImag',
+        'RealImagToComplex': 'RealImagToComplex',
+        'Concatenate': 'Concatenate',
+        'DiscretePulseGenerator': 'DiscretePulseGenerator',
+        'RelationalOperator': 'RelationalOperator',
+        'Math': 'MathFunction',
+        'Trigonometry': 'Trigonometry',
+        'Logic': 'LogicOperator',
+        'ToWorkspace': 'ToWorkspace',
+        'FromWorkspace': 'FromWorkspace',
+        'DataTypeConversion': 'DataTypeConversion',
+        'DiscreteFilter': 'DiscreteFilter',
+        'DiscreteTransferFcn': 'DiscreteTransferFcn',
+        'UnitDelay': 'UnitDelay',
+        'ZeroOrderHold': 'ZeroOrderHold',
+        'Quantizer': 'Quantizer',
+        'Memory': 'Memory',
+        'BusCreator': 'BusCreator',
+        'BusSelector': 'BusSelector',
+        'MultiPortSwitch': 'MultiPortSwitch',
+        'Selector': 'Selector',
+        'Reshape': 'Reshape',
+        'DotProduct': 'DotProduct',
+        'Display': 'Display',
+        'Terminator': 'Terminator',
+        'Goto': 'Goto',
+        'From': 'From',
+        'EnablePort': 'EnablePort',
+        'Merge': 'Merge',
+    }
+    return m.get(btype, btype)
 
 
 def _val(content, key):
-    m = re.search(rf'^\s*{re.escape(key)}\s+"?([^"\n]+)"?', content, re.MULTILINE)
+    m = re.search(
+        rf'^\s*{re.escape(key)}\s+"?([^"\n]+)"?\s*$',
+        content, re.MULTILINE
+    )
     return m.group(1).strip().strip('"') if m else None
