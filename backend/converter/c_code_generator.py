@@ -21,7 +21,36 @@ def generate_c_code(blocks, connections):
 
     lines += ["typedef double Signal;", ""]
 
-    # State blocks
+    # ---- Build connection maps (support BOTH id-based and name-based connections) ----
+    block_by_id   = {str(b['id']): b for b in blocks}
+    block_by_name = {b['name']: b for b in blocks}
+
+    # Normalise connections so everything uses string IDs
+    norm_connections = []
+    for c in connections:
+        src = str(c.get('from', ''))
+        dst = str(c.get('to', ''))
+
+        # If src looks like a name (not a pure number), resolve to id
+        if src and not src.isdigit():
+            if src in block_by_name:
+                src = str(block_by_name[src]['id'])
+        if dst and not dst.isdigit():
+            if dst in block_by_name:
+                dst = str(block_by_name[dst]['id'])
+
+        if src and dst:
+            norm_connections.append({'from': src, 'to': dst})
+
+    conn_map = {}   # src_id -> [dst_id, ...]
+    in_map   = {}   # dst_id -> [src_id, ...]
+    for c in norm_connections:
+        s = c['from']
+        d = c['to']
+        conn_map.setdefault(s, []).append(d)
+        in_map.setdefault(d, []).append(s)
+
+    # ---- State blocks ----
     state_types = ['Integrator', 'Derivative', 'UnitDelay', 'ZeroOrderHold',
                    'TransferFcn', 'PIDController', 'StateSpace', 'SineWave', 'Step']
     state_blocks = [b for b in blocks if b['type'] in state_types]
@@ -46,7 +75,7 @@ def generate_c_code(blocks, connections):
                 lines.append(f"static double time_{n} = 0.0;")
         lines.append("")
 
-    # Constants
+    # ---- Constants ----
     const_blocks = [b for b in blocks if b['type'] == 'Constant']
     if const_blocks:
         lines.append("/* --- Constants --- */")
@@ -56,7 +85,7 @@ def generate_c_code(blocks, connections):
             lines.append(f"#define CONST_{n.upper()} ({v})")
         lines.append("")
 
-    # Gain params
+    # ---- Gain parameters ----
     gain_blocks = [b for b in blocks if b['type'] == 'Gain']
     if gain_blocks:
         lines.append("/* --- Gain Parameters --- */")
@@ -66,21 +95,10 @@ def generate_c_code(blocks, connections):
             lines.append(f"static const Signal GAIN_{n.upper()} = {v};")
         lines.append("")
 
-    # Build maps
-    conn_map = {}   # src_id -> [dst_id, ...]
-    in_map = {}     # dst_id -> [src_id, ...]
-    for c in connections:
-        s = str(c.get('from', ''))
-        d = str(c.get('to', ''))
-        conn_map.setdefault(s, []).append(d)
-        in_map.setdefault(d, []).append(s)
-
-    block_by_id = {str(b['id']): b for b in blocks}
-
     inports  = [b for b in blocks if b['type'] in ['Inport', 'In']]
     outports = [b for b in blocks if b['type'] in ['Outport', 'Out']]
 
-    # Function signature
+    # ---- Function signature ----
     lines += [
         "/* ================================================",
         "   model_step() — call every simulation time step",
@@ -102,7 +120,7 @@ def generate_c_code(blocks, connections):
     lines.append("    static const double dt = 0.001;  /* Sample time in seconds */")
     lines.append("")
 
-    # Signal wire declarations
+    # ---- Signal wire declarations ----
     all_sig_names = sorted(set(f"sig_{_sname(b['name'])}" for b in blocks))
     if all_sig_names:
         lines.append("    /* Signal wires */")
@@ -110,7 +128,7 @@ def generate_c_code(blocks, connections):
             lines.append(f"    Signal {s} = 0.0;")
         lines.append("")
 
-    # Topologically sorted block processing
+    # ---- Topologically sorted block processing ----
     ordered = _topo_sort(blocks, conn_map)
 
     lines.append("    /* --- Signal Flow --- */")
@@ -119,10 +137,17 @@ def generate_c_code(blocks, connections):
         bt   = b['type']
         bn   = _sname(b['name'])
         bp   = b.get('params', {})
-        ins  = in_map.get(bid, [])
-        insigs = [f"sig_{_sname(block_by_id[i]['name'])}" for i in ins if i in block_by_id]
-        in0  = insigs[0] if insigs else "0.0"
-        out  = f"sig_{bn}"
+
+        # Get input signals for this block
+        src_ids = in_map.get(bid, [])
+        insigs  = []
+        for sid in src_ids:
+            src_block = block_by_id.get(sid)
+            if src_block:
+                insigs.append(f"sig_{_sname(src_block['name'])}")
+
+        in0 = insigs[0] if insigs else "0.0"
+        out = f"sig_{bn}"
 
         lines.append("")
         lines.append(f"    /* [{bt}] {b['name']} */")
@@ -131,19 +156,23 @@ def generate_c_code(blocks, connections):
 
     lines.append("")
 
-    # Assign outputs
+    # ---- Assign outputs ----
     for op in outports:
-        on = _sname(op['name'])
+        on   = _sname(op['name'])
         srcs = in_map.get(str(op['id']), [])
-        if srcs and srcs[0] in block_by_id:
-            src_sig = f"sig_{_sname(block_by_id[srcs[0]]['name'])}"
+        if srcs:
+            src_block = block_by_id.get(srcs[0])
+            if src_block:
+                src_sig = f"sig_{_sname(src_block['name'])}"
+            else:
+                src_sig = f"sig_{on}"
         else:
             src_sig = f"sig_{on}"
         lines.append(f"    *{on}_out = {src_sig};")
 
     lines += ["}", ""]
 
-    # Init function
+    # ---- Init function ----
     lines += [
         "/* ================================================",
         "   model_init() — call once before simulation",
@@ -167,7 +196,7 @@ def generate_c_code(blocks, connections):
             lines.append(f"    time_{n} = 0.0;")
     lines += ["}", ""]
 
-    # Example main
+    # ---- Example main ----
     lines += [
         "/* ================================================",
         "   main() — example usage",
@@ -212,9 +241,12 @@ def generate_c_code(blocks, connections):
     return '\n'.join(lines)
 
 
-# ---- Block → C Code ----
+# ================================================================
+# Block → C Code
+# ================================================================
 
 def _block_c(btype, bn, out, in0, all_ins, params):
+
     if btype in ['Inport', 'In']:
         return [f"{out} = {bn}_in;"]
 
@@ -284,7 +316,7 @@ def _block_c(btype, bn, out, in0, all_ins, params):
         ]
 
     if btype == 'Switch':
-        thr = _safe_float(params.get('Threshold', '0.5'), '0.5')
+        thr  = _safe_float(params.get('Threshold', '0.5'), '0.5')
         ctrl = all_ins[1] if len(all_ins) > 1 else in0
         in2  = all_ins[2] if len(all_ins) > 2 else '0.0'
         return [f"{out} = ({ctrl} >= {thr}) ? {in0} : {in2};"]
@@ -299,9 +331,9 @@ def _block_c(btype, bn, out, in0, all_ins, params):
         ]
 
     if btype == 'PIDController':
-        kp = _safe_float(params.get('P', params.get('Kp', '1.0')), '1.0')
-        ki = _safe_float(params.get('I', params.get('Ki', '0.1')), '0.1')
-        kd = _safe_float(params.get('D', params.get('Kd', '0.01')), '0.01')
+        kp = _safe_float(params.get('P',  params.get('Kp', '1.0')),  '1.0')
+        ki = _safe_float(params.get('I',  params.get('Ki', '0.1')),  '0.1')
+        kd = _safe_float(params.get('D',  params.get('Kd', '0.01')), '0.01')
         return [
             f"pid_int_{bn} += {in0} * dt;",
             f"Signal pid_d_{bn} = ({in0} - pid_prev_{bn}) / dt;",
@@ -312,14 +344,14 @@ def _block_c(btype, bn, out, in0, all_ins, params):
     if btype == 'SineWave':
         amp  = _safe_float(params.get('Amplitude', '1.0'), '1.0')
         freq = _safe_float(params.get('Frequency', '1.0'), '1.0')
-        bias = _safe_float(params.get('Bias', '0.0'), '0.0')
+        bias = _safe_float(params.get('Bias',      '0.0'), '0.0')
         return [
             f"{out} = {bias} + {amp} * sin(2.0 * 3.14159265358979 * {freq} * time_{bn});",
             f"time_{bn} += dt;"
         ]
 
     if btype == 'Step':
-        st  = _safe_float(params.get('Time', '1.0'), '1.0')
+        st  = _safe_float(params.get('Time',   '1.0'), '1.0')
         bef = _safe_float(params.get('Before', '0.0'), '0.0')
         aft = _safe_float(params.get('After',  '1.0'), '1.0')
         return [
@@ -348,7 +380,9 @@ def _block_c(btype, bn, out, in0, all_ins, params):
     ]
 
 
-# ---- Helpers ----
+# ================================================================
+# Helpers
+# ================================================================
 
 def _sname(name):
     name = str(name)
@@ -369,16 +403,16 @@ def _safe_float(val, fallback):
 def _topo_sort(blocks, conn_map):
     from collections import defaultdict, deque
 
-    ids = [str(b['id']) for b in blocks]
+    ids    = [str(b['id']) for b in blocks]
     in_deg = defaultdict(int)
 
     for src, dsts in conn_map.items():
         for d in dsts:
             in_deg[d] += 1
 
-    queue = deque(bid for bid in ids if in_deg[bid] == 0)
-    order = []
-    by_id = {str(b['id']): b for b in blocks}
+    queue  = deque(bid for bid in ids if in_deg[bid] == 0)
+    order  = []
+    by_id  = {str(b['id']): b for b in blocks}
 
     while queue:
         node = queue.popleft()
