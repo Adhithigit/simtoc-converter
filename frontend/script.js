@@ -1,376 +1,423 @@
-// =========================================
+// ================================================
 // SimToC — Frontend Script
-// =========================================
-
+// ================================================
 const API = 'https://simtoc-converter.onrender.com';
-// When running locally change above to: 'http://localhost:8080'
 
 let currentCode = '';
 let selectedFile = null;
 
 // ---- Init ----
 document.addEventListener('DOMContentLoaded', () => {
-    checkStatus();
-    initParticles();
-    setupDrop();
-    document.getElementById('file-input').addEventListener('change', e => {
-        if (e.target.files[0]) handleFile(e.target.files[0]);
-    });
-    setInterval(checkStatus, 15000);
+  checkStatus();
+  initParticles();
+  setupDrop();
+  document.getElementById('file-input').addEventListener('change', e => {
+    if (e.target.files[0]) handleFile(e.target.files[0]);
+  });
+  setInterval(checkStatus, 30000);
 });
 
-// ---- Status ----
+// ---- Status Check ----
 async function checkStatus() {
-    try {
-        const r = await fetch(`${API}/health`);
-        if (r.ok) {
-            document.getElementById('status-dot').className = 'status-dot on';
-            document.getElementById('status-text').textContent = 'Backend Online';
-        } else { setOff(); }
-    } catch { setOff(); }
-}
-
-function setOff() {
-    document.getElementById('status-dot').className = 'status-dot';
-    document.getElementById('status-text').textContent = 'Backend Offline';
+  const dot  = document.getElementById('status-dot');
+  const text = document.getElementById('status-text');
+  try {
+    const r = await fetch(`${API}/health`, { signal: AbortSignal.timeout(8000) });
+    if (r.ok) {
+      dot.className  = 'status-dot online';
+      text.textContent = 'Backend Online';
+    } else { throw new Error(); }
+  } catch {
+    dot.className  = 'status-dot offline';
+    text.textContent = 'Backend Offline';
+  }
 }
 
 // ---- Drag & Drop ----
 function setupDrop() {
-    const zone = document.getElementById('upload-zone');
-    zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('drag'); });
-    zone.addEventListener('dragleave', () => zone.classList.remove('drag'));
-    zone.addEventListener('drop', e => {
-        e.preventDefault(); zone.classList.remove('drag');
-        if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
-    });
-    zone.addEventListener('click', e => {
-        if (e.target.tagName !== 'BUTTON') document.getElementById('file-input').click();
-    });
+  const zone = document.getElementById('drop-zone');
+  zone.addEventListener('dragover',  e => { e.preventDefault(); zone.classList.add('drag-over'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+  zone.addEventListener('drop', e => {
+    e.preventDefault();
+    zone.classList.remove('drag-over');
+    if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+  });
 }
 
 // ---- File Handling ----
 function handleFile(file) {
-    const ok = ['slx','mdl','pdf','png','jpg','jpeg','bmp'];
-    const ext = file.name.split('.').pop().toLowerCase();
-    if (!ok.includes(ext)) { toast('❌ Unsupported file type', true); return; }
+  const allowed = ['slx','mdl','pdf','png','jpg','jpeg','bmp'];
+  const ext = file.name.split('.').pop().toLowerCase();
+  if (!allowed.includes(ext)) { toast('Unsupported file type!', true); return; }
 
-    selectedFile = file;
-
-    const icons = { slx:'🔧', mdl:'📐', pdf:'📄', png:'🖼️', jpg:'🖼️', jpeg:'🖼️', bmp:'🖼️' };
-    document.getElementById('file-icon-display').textContent = icons[ext] || '📄';
-    document.getElementById('file-name-display').textContent = file.name;
-    document.getElementById('file-size-display').textContent = fmtBytes(file.size);
-    document.getElementById('upload-zone').style.display = 'none';
-    document.getElementById('file-badge-wrap').style.display = 'block';
-    document.getElementById('convert-btn').disabled = false;
+  selectedFile = file;
+  document.getElementById('drop-zone').style.display = 'none';
+  const info = document.getElementById('file-info');
+  info.style.display = 'flex';
+  document.getElementById('file-name').textContent = file.name;
+  document.getElementById('file-size').textContent = formatSize(file.size);
+  document.getElementById('btn-convert').disabled = false;
 }
 
-function removeFile() {
-    selectedFile = null;
-    document.getElementById('file-input').value = '';
-    document.getElementById('file-badge-wrap').style.display = 'none';
-    document.getElementById('upload-zone').style.display = 'block';
-    document.getElementById('convert-btn').disabled = true;
-    document.getElementById('stats-grid').style.display = 'none';
+function clearFile() {
+  selectedFile = null;
+  document.getElementById('drop-zone').style.display = 'block';
+  document.getElementById('file-info').style.display = 'none';
+  document.getElementById('btn-convert').disabled = true;
+  document.getElementById('file-input').value = '';
 }
 
-function fmtBytes(b) {
-    if (b < 1024) return b + ' B';
-    if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
-    return (b/1048576).toFixed(1) + ' MB';
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+  return (bytes/1024/1024).toFixed(1) + ' MB';
 }
 
 // ---- Convert ----
-async function startConvert() {
-    if (!selectedFile) return;
+async function convertFile() {
+  if (!selectedFile) return;
 
-    document.getElementById('loading').style.display = 'flex';
+  const btn  = document.getElementById('btn-convert');
+  const text = document.getElementById('btn-text');
+  btn.disabled = true;
+  btn.classList.add('loading');
+  text.textContent = '⏳ Converting...';
 
-    const steps = [
-        'Parsing block diagram...',
-        'Mapping signal flows...',
-        'Identifying block types...',
-        'Generating C code...',
-        'Building diagram data...',
-        'Finalizing output...'
-    ];
+  // Hide previous results
+  document.getElementById('diagram-empty').style.display = 'flex';
+  document.getElementById('diagram-svg').style.display = 'none';
+  document.getElementById('code-empty').style.display = 'flex';
+  document.getElementById('code-output').style.display = 'none';
+  document.getElementById('stats-grid').style.display = 'none';
 
-    let si = 0;
-    const subEl = document.getElementById('loading-sub');
-    const interval = setInterval(() => {
-        subEl.textContent = steps[si % steps.length];
-        si++;
-    }, 1000);
+  try {
+    const fd = new FormData();
+    fd.append('file', selectedFile);
 
-    try {
-        const fd = new FormData();
-        fd.append('file', selectedFile);
-
-        const res = await fetch(`${API}/convert`, { method:'POST', body: fd });
-        const data = await res.json();
-        clearInterval(interval);
-
-        if (!res.ok || data.error) {
-            toast('❌ ' + (data.error || 'Conversion failed'), true);
-            return;
-        }
-
-        currentCode = data.c_code;
-
-        // Stats
-        document.getElementById('s-blocks').textContent = data.block_count;
-        document.getElementById('s-conns').textContent = data.connection_count;
-        document.getElementById('s-lines').textContent = data.c_code.split('\n').length;
-        document.getElementById('stats-grid').style.display = 'grid';
-
-        // Code display
-        document.getElementById('code-placeholder').style.display = 'none';
-        const el = document.getElementById('code-el');
-        el.textContent = data.c_code;
-        document.getElementById('code-pre').style.display = 'block';
-        hljs.highlightElement(el);
-
-        // Buttons
-        document.getElementById('copy-btn').style.display = 'inline-flex';
-        document.getElementById('dl-btn').style.display = 'inline-flex';
-
-        // Diagram
-        drawDiagram(data.diagram);
-
-        toast('✅ Conversion complete!');
-
-    } catch(err) {
-        clearInterval(interval);
-        toast('❌ Cannot reach backend. Check connection.', true);
-        console.error(err);
-    } finally {
-        document.getElementById('loading').style.display = 'none';
+    const r = await fetch(`${API}/convert`, { method: 'POST', body: fd });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ error: 'Server error' }));
+      throw new Error(err.error || `HTTP ${r.status}`);
     }
+
+    const data = await r.json();
+    if (data.error) throw new Error(data.error);
+
+    displayResults(data);
+    toast('✅ Conversion successful!');
+  } catch (e) {
+    toast(`❌ ${e.message}`, true);
+    console.error(e);
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove('loading');
+    text.textContent = '⚡ Convert to C';
+  }
+}
+
+// ---- Display Results ----
+function displayResults(data) {
+  currentCode = data.c_code || '';
+
+  // Stats
+  const lines = currentCode.split('\n').length;
+  document.getElementById('stat-blocks').textContent = (data.blocks || []).length;
+  document.getElementById('stat-conns').textContent  = (data.connections || []).length;
+  document.getElementById('stat-lines').textContent  = lines;
+  document.getElementById('stats-grid').style.display = 'grid';
+
+  // Code
+  if (currentCode) {
+    document.getElementById('code-empty').style.display  = 'none';
+    document.getElementById('code-output').style.display = 'block';
+    const el = document.getElementById('code-content');
+    el.textContent = currentCode;
+    hljs.highlightElement(el);
+  }
+
+  // Diagram
+  if (data.blocks && data.blocks.length > 0) {
+    document.getElementById('diagram-empty').style.display = 'none';
+    document.getElementById('diagram-svg').style.display   = 'block';
+    renderDiagram(data.blocks, data.connections || []);
+  }
 }
 
 // ---- D3 Diagram ----
-function drawDiagram(data) {
-    const { blocks, connections } = data;
-    if (!blocks || !blocks.length) return;
+let svgEl, zoomBehavior;
 
-    document.getElementById('diag-placeholder').style.display = 'none';
-    const svg = document.getElementById('diag-svg');
-    svg.style.display = 'block';
+function renderDiagram(blocks, connections) {
+  const container = document.getElementById('diagram-container');
+  const W = container.clientWidth;
+  const H = container.clientHeight;
 
-    const wrap = document.getElementById('diagram-wrap');
-    const W = wrap.clientWidth, H = wrap.clientHeight;
+  const svg = d3.select('#diagram-svg');
+  svg.selectAll('*').remove();
 
-    const s = d3.select('#diag-svg');
-    s.selectAll('*').remove();
-    s.attr('viewBox', `0 0 ${W} ${H}`);
+  // Arrow marker
+  svg.append('defs').append('marker')
+    .attr('id', 'arrow')
+    .attr('viewBox', '0 -5 10 10')
+    .attr('refX', 10).attr('refY', 0)
+    .attr('markerWidth', 6).attr('markerHeight', 6)
+    .attr('orient', 'auto')
+    .append('path')
+    .attr('d', 'M0,-5L10,0L0,5')
+    .attr('fill', 'rgba(0,212,255,0.7)');
 
-    // Defs
-    const defs = s.append('defs');
+  const g = svg.append('g').attr('class', 'zoom-group');
 
-    defs.append('marker').attr('id','arr')
-        .attr('viewBox','0 -5 10 10').attr('refX',10).attr('refY',0)
-        .attr('markerWidth',7).attr('markerHeight',7).attr('orient','auto')
-        .append('path').attr('d','M0,-5L10,0L0,5').attr('fill','rgba(0,212,255,.8)');
+  zoomBehavior = d3.zoom()
+    .scaleExtent([0.1, 4])
+    .on('zoom', e => g.attr('transform', e.transform));
+  svg.call(zoomBehavior);
 
-    const gf = defs.append('filter').attr('id','glow');
-    gf.append('feGaussianBlur').attr('stdDeviation','3').attr('result','cb');
-    const fm = gf.append('feMerge');
-    fm.append('feMergeNode').attr('in','cb');
-    fm.append('feMergeNode').attr('in','SourceGraphic');
+  // Layout: use positions from MDL if available, else auto-layout
+  const NODE_W = 100;
+  const NODE_H = 36;
+  const PAD_X  = 140;
+  const PAD_Y  = 60;
 
-    const g = s.append('g');
+  // Check if we have real positions
+  const hasPositions = blocks.some(b => b.x !== 0 || b.y !== 0);
 
-    // Layout
-    const BW = 100, BH = 48;
-    const allZero = blocks.every(b => b.x === 0 && b.y === 0);
-    const cols = Math.ceil(Math.sqrt(blocks.length));
+  let nodeMap = {};
+  let positions = {};
 
-    const laid = blocks.map((b, i) => ({
-        ...b,
-        px: allZero ? 40 + (i % cols) * 160 : b.x,
-        py: allZero ? 40 + Math.floor(i / cols) * 110 : b.y
-    }));
+  if (hasPositions) {
+    // Use real positions but scale them
+    const xs = blocks.map(b => b.x);
+    const ys = blocks.map(b => b.y);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    const rangeX = maxX - minX || 1;
+    const rangeY = maxY - minY || 1;
 
-    const maxX = Math.max(...laid.map(b => b.px)) + BW + 20;
-    const maxY = Math.max(...laid.map(b => b.py)) + BH + 20;
-    const sc = Math.min((W - 40) / maxX, (H - 40) / maxY, 1.8);
-
-    const byId = {};
-    laid.forEach(b => { byId[b.id] = b; });
-
-    const colors = {
-        Gain:'#4d9fff', Sum:'#00ff88', Integrator:'#8b5cf6',
-        Derivative:'#8b5cf6', Inport:'#00d4ff', Outport:'#ff6b35',
-        Constant:'#ffd700', Scope:'#ff4d88', PIDController:'#8b5cf6',
-        TransferFcn:'#4d9fff', Saturation:'#ff6b35', Step:'#00ff88',
-        SineWave:'#00d4ff', Product:'#4d9fff', Switch:'#ffd700'
-    };
-
-    // Connections
-    connections.forEach((c, i) => {
-        const src = byId[c.from] || byId[String(c.from)];
-        const dst = byId[c.to]   || byId[String(c.to)];
-        if (!src || !dst) return;
-
-        const x1 = src.px * sc + BW * sc / 2;
-        const y1 = src.py * sc + BH * sc / 2;
-        const x2 = dst.px * sc + BW * sc / 2;
-        const y2 = dst.py * sc + BH * sc / 2;
-
-        g.append('line')
-            .attr('x1',x1).attr('y1',y1)
-            .attr('x2',x1).attr('y2',y1)
-            .attr('stroke','rgba(0,212,255,.5)')
-            .attr('stroke-width',2)
-            .attr('marker-end','url(#arr)')
-            .transition().delay(i*120+350).duration(550)
-            .attr('x2',x2).attr('y2',y2);
+    blocks.forEach(b => {
+      positions[b.id] = {
+        x: 60 + ((b.x - minX) / rangeX) * (W - 200),
+        y: 40 + ((b.y - minY) / rangeY) * (H - 100)
+      };
     });
+  } else {
+    // Auto layout: left to right by topological order
+    const inDeg = {};
+    blocks.forEach(b => inDeg[b.id] = 0);
+    connections.forEach(c => { if (inDeg[c.to] !== undefined) inDeg[c.to]++; });
 
-    // Blocks
-    laid.forEach((b, i) => {
-        const bx = b.px * sc, by = b.py * sc;
-        const bw = BW * sc, bh = BH * sc;
-        const col = colors[b.type] || '#334155';
+    const layers = [];
+    let remaining = [...blocks];
+    let placed = new Set();
 
-        const bg = g.append('g').attr('opacity',0)
-            .attr('transform', `translate(${bx},${by})`);
+    while (remaining.length > 0) {
+      const layer = remaining.filter(b => inDeg[b.id] === 0 && !placed.has(b.id));
+      if (layer.length === 0) { // break cycles
+        const fallback = remaining.filter(b => !placed.has(b.id));
+        if (fallback.length) { layers.push([fallback[0]]); placed.add(fallback[0].id); }
+        break;
+      }
+      layers.push(layer);
+      layer.forEach(b => {
+        placed.add(b.id);
+        connections.filter(c => c.from === b.id).forEach(c => {
+          if (inDeg[c.to] !== undefined) inDeg[c.to]--;
+        });
+      });
+      remaining = remaining.filter(b => !placed.has(b.id));
+    }
 
-        bg.append('rect')
-            .attr('width',bw).attr('height',bh).attr('rx',8).attr('ry',8)
-            .attr('fill', col+'22').attr('stroke', col)
-            .attr('stroke-width',1.5).attr('filter','url(#glow)');
-
-        bg.append('text')
-            .attr('x',bw/2).attr('y',bh*.35)
-            .attr('text-anchor','middle').attr('dominant-baseline','middle')
-            .attr('fill',col)
-            .attr('font-size', Math.max(8, 10*sc))
-            .attr('font-family','Courier New').attr('font-weight','bold')
-            .text(b.type);
-
-        const label = b.name.length > 13 ? b.name.slice(0,13)+'…' : b.name;
-        bg.append('text')
-            .attr('x',bw/2).attr('y',bh*.68)
-            .attr('text-anchor','middle').attr('dominant-baseline','middle')
-            .attr('fill','rgba(255,255,255,.55)')
-            .attr('font-size', Math.max(6, 8*sc))
-            .attr('font-family','Courier New')
-            .text(label);
-
-        bg.transition().delay(i*80).duration(380).attr('opacity',1);
+    layers.forEach((layer, li) => {
+      layer.forEach((b, bi) => {
+        positions[b.id] = {
+          x: 60 + li * PAD_X,
+          y: 40 + bi * PAD_Y
+        };
+      });
     });
+  }
 
-    // Zoom
-    const zoom = d3.zoom().scaleExtent([.25,5])
-        .on('zoom', e => g.attr('transform', e.transform));
-    s.call(zoom);
-    window._zoom = zoom;
-    window._svg = s;
+  blocks.forEach(b => { nodeMap[b.id] = b; });
+
+  // Block color by type
+  function blockColor(type) {
+    const t = (type || '').toLowerCase();
+    if (['inport','in'].includes(t))         return '#1a4a2e';
+    if (['outport','out'].includes(t))        return '#2e1a4a';
+    if (['gain','product','sum'].includes(t)) return '#1a2e4a';
+    if (t.includes('integrator') || t.includes('delay') || t.includes('memory')) return '#2e2a1a';
+    if (t.includes('subsystem'))              return '#1e3040';
+    if (t.includes('sfunc') || t.includes('reference')) return '#2e1a1a';
+    if (['constant','step','sinewave'].includes(t)) return '#1a3a2e';
+    return '#1a2235';
+  }
+  function blockBorder(type) {
+    const t = (type || '').toLowerCase();
+    if (['inport','in'].includes(t))  return '#00ff88';
+    if (['outport','out'].includes(t)) return '#aa44ff';
+    if (t.includes('sfunc') || t.includes('reference')) return '#ff4466';
+    if (t.includes('subsystem'))      return '#0099cc';
+    return '#1e3a5a';
+  }
+
+  // Draw connections
+  const linkGroup = g.append('g');
+  connections.forEach(c => {
+    const src = positions[c.from];
+    const dst = positions[c.to];
+    if (!src || !dst) return;
+
+    const x1 = src.x + NODE_W;
+    const y1 = src.y + NODE_H / 2;
+    const x2 = dst.x;
+    const y2 = dst.y + NODE_H / 2;
+    const mx = (x1 + x2) / 2;
+
+    linkGroup.append('path')
+      .attr('class', 'link')
+      .attr('d', `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`)
+      .attr('marker-end', 'url(#arrow)');
+  });
+
+  // Draw nodes
+  const nodeGroup = g.append('g');
+  blocks.forEach(b => {
+    const pos = positions[b.id];
+    if (!pos) return;
+
+    const node = nodeGroup.append('g')
+      .attr('class', 'block-node')
+      .attr('transform', `translate(${pos.x},${pos.y})`)
+      .style('cursor', 'pointer');
+
+    node.append('rect')
+      .attr('width', NODE_W)
+      .attr('height', NODE_H)
+      .attr('rx', 6)
+      .attr('fill', blockColor(b.type))
+      .attr('stroke', blockBorder(b.type))
+      .attr('stroke-width', 1.5);
+
+    // Type label
+    node.append('text')
+      .attr('x', NODE_W / 2)
+      .attr('y', 13)
+      .attr('text-anchor', 'middle')
+      .attr('fill', '#88aacc')
+      .attr('font-size', '8px')
+      .text(b.type || '');
+
+    // Name label (truncated)
+    const name = (b.name || '').replace(/\\n/g, ' ');
+    node.append('text')
+      .attr('x', NODE_W / 2)
+      .attr('y', 27)
+      .attr('text-anchor', 'middle')
+      .attr('fill', '#e0eeff')
+      .attr('font-size', '9px')
+      .attr('font-weight', '600')
+      .text(name.length > 14 ? name.slice(0, 13) + '…' : name);
+
+    // Tooltip on hover
+    node.append('title').text(`[${b.type}] ${b.name}`);
+  });
+
+  // Auto fit
+  setTimeout(() => fitDiagram(), 100);
+}
+
+function fitDiagram() {
+  const svg = document.getElementById('diagram-svg');
+  const g   = svg.querySelector('.zoom-group');
+  if (!g || !zoomBehavior) return;
+
+  const svgRect = svg.getBoundingClientRect();
+  const gRect   = g.getBoundingClientRect();
+  if (gRect.width === 0) return;
+
+  const scaleX = (svgRect.width  - 80) / gRect.width;
+  const scaleY = (svgRect.height - 80) / gRect.height;
+  const scale  = Math.min(scaleX, scaleY, 2);
+
+  const tx = (svgRect.width  - gRect.width  * scale) / 2;
+  const ty = (svgRect.height - gRect.height * scale) / 2;
+
+  d3.select('#diagram-svg').transition().duration(400)
+    .call(zoomBehavior.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
 }
 
 function resetZoom() {
-    if (window._svg && window._zoom)
-        window._svg.transition().duration(450)
-            .call(window._zoom.transform, d3.zoomIdentity);
+  d3.select('#diagram-svg').transition().duration(400)
+    .call(zoomBehavior.transform, d3.zoomIdentity);
 }
 
-// ---- Code actions ----
-function copyCode() {
-    navigator.clipboard.writeText(currentCode)
-        .then(() => toast('✅ Copied to clipboard!'))
-        .catch(() => toast('❌ Copy failed', true));
+// ---- Copy & Download ----
+async function copyCode() {
+  if (!currentCode) return;
+  try {
+    await navigator.clipboard.writeText(currentCode);
+    toast('📋 Code copied to clipboard!');
+  } catch {
+    toast('❌ Copy failed', true);
+  }
 }
 
-function openDownload() { document.getElementById('dl-modal').style.display = 'flex'; }
-function closeDownload() { document.getElementById('dl-modal').style.display = 'none'; }
-function setName(n) { document.getElementById('dl-name').value = n; }
-
-async function doDownload() {
-    if (!currentCode) return;
-    const fname = document.getElementById('dl-name').value || 'model_output.c';
-
-    if (window.showSaveFilePicker) {
-        try {
-            const handle = await window.showSaveFilePicker({
-                suggestedName: fname,
-                types: [{ description:'C Source File', accept:{'text/x-csrc':['.c']} }]
-            });
-            const w = await handle.createWritable();
-            await w.write(currentCode);
-            await w.close();
-            toast('✅ File saved!');
-            closeDownload();
-            return;
-        } catch(e) { /* user cancelled picker */ }
-    }
-
-    // Fallback
-    const blob = new Blob([currentCode], { type:'text/x-csrc' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = fname;
-    document.body.appendChild(a); a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    toast('✅ Download started!');
-    closeDownload();
+function downloadCode() {
+  if (!currentCode) return;
+  const name = selectedFile ? selectedFile.name.replace(/\.[^.]+$/, '') : 'model';
+  const blob = new Blob([currentCode], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${name}_output.c`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast('⬇ Downloading...');
 }
 
 // ---- Toast ----
-function toast(msg, isErr=false) {
-    const t = document.getElementById('toast');
-    t.textContent = msg;
-    t.className = 'toast show' + (isErr ? ' err' : '');
-    setTimeout(() => t.className = 'toast', 3500);
+function toast(msg, isError = false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.borderColor = isError ? 'var(--red)' : 'var(--cyan)';
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 3000);
 }
 
-// ---- Particles ----
+// ---- Background Particles ----
 function initParticles() {
-    const c = document.getElementById('particle-canvas');
-    const ctx = c.getContext('2d');
+  const canvas = document.getElementById('bg-canvas');
+  const ctx = canvas.getContext('2d');
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
 
-    const resize = () => { c.width = innerWidth; c.height = innerHeight; };
-    resize();
-    window.addEventListener('resize', resize);
+  const particles = Array.from({ length: 60 }, () => ({
+    x: Math.random() * canvas.width,
+    y: Math.random() * canvas.height,
+    vx: (Math.random() - 0.5) * 0.3,
+    vy: (Math.random() - 0.5) * 0.3,
+    r:  Math.random() * 1.5 + 0.5,
+    a:  Math.random()
+  }));
 
-    const pts = Array.from({length:55}, () => ({
-        x: Math.random() * innerWidth,
-        y: Math.random() * innerHeight,
-        vx: (Math.random()-.5)*.4,
-        vy: (Math.random()-.5)*.4,
-        r: Math.random()*1.8+.4,
-        op: Math.random()*.45+.1,
-        col: Math.random()>.5 ? '0,212,255' : '77,159,255'
-    }));
+  function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    particles.forEach(p => {
+      p.x += p.vx; p.y += p.vy;
+      if (p.x < 0) p.x = canvas.width;
+      if (p.x > canvas.width) p.x = 0;
+      if (p.y < 0) p.y = canvas.height;
+      if (p.y > canvas.height) p.y = 0;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(0,212,255,${p.a * 0.4})`;
+      ctx.fill();
+    });
+    requestAnimationFrame(draw);
+  }
+  draw();
 
-    (function frame() {
-        ctx.clearRect(0,0,c.width,c.height);
-        pts.forEach(p => {
-            p.x += p.vx; p.y += p.vy;
-            if (p.x < 0) p.x = c.width;
-            if (p.x > c.width) p.x = 0;
-            if (p.y < 0) p.y = c.height;
-            if (p.y > c.height) p.y = 0;
-            ctx.beginPath();
-            ctx.arc(p.x,p.y,p.r,0,Math.PI*2);
-            ctx.fillStyle = `rgba(${p.col},${p.op})`;
-            ctx.fill();
-        });
-        for (let i=0;i<pts.length;i++) {
-            for (let j=i+1;j<pts.length;j++) {
-                const dx=pts[i].x-pts[j].x, dy=pts[i].y-pts[j].y;
-                const d=Math.sqrt(dx*dx+dy*dy);
-                if (d<90) {
-                    ctx.beginPath();
-                    ctx.moveTo(pts[i].x,pts[i].y);
-                    ctx.lineTo(pts[j].x,pts[j].y);
-                    ctx.strokeStyle=`rgba(0,212,255,${.07*(1-d/90)})`;
-                    ctx.lineWidth=.5;ctx.stroke();
-                }
-            }
-        }
-        requestAnimationFrame(frame);
-    })();
+  window.addEventListener('resize', () => {
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+  });
 }
