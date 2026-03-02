@@ -14,153 +14,122 @@ def parse_mdl(filepath):
 
     content = content.replace('\r\n', '\n').replace('\r', '\n')
 
-    # ---- Parse all Block sections ----
-    block_pattern = re.compile(
-        r'^\s*Block\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}',
-        re.MULTILINE | re.DOTALL
-    )
+    # ---- Parse ALL Block sections using brace matching ----
+    pos = 0
+    while pos < len(content):
+        m = re.search(r'\bBlock\s*\{', content[pos:])
+        if not m:
+            break
+        abs_start = pos + m.start()
+        brace_open = pos + m.end() - 1
 
-    for m in block_pattern.finditer(content):
-        bc = m.group(1)
-        btype = _val(bc, 'BlockType')
-        bname = _val(bc, 'Name')
-        pos   = _val(bc, 'Position')
+        # Find matching closing brace
+        depth = 0
+        bc = None
+        for i in range(brace_open, min(brace_open + 20000, len(content))):
+            if content[i] == '{': depth += 1
+            elif content[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    bc = content[brace_open+1:i]
+                    break
 
-        if not btype:
-            continue
+        if bc:
+            btype_m = re.search(r'^\s*BlockType\s+"?([^"\n]+)"?\s*$', bc, re.MULTILINE)
+            bname_m = re.search(r'^\s*Name\s+"?([^"\n]+)"?\s*$', bc, re.MULTILINE)
+            pos_m   = re.search(r'^\s*Position\s+\[([^\]]+)\]', bc, re.MULTILINE)
 
-        btype = btype.strip().strip('"')
-        bname = (bname or '').strip().strip('"').strip()
+            if btype_m:
+                btype = btype_m.group(1).strip().strip('"')
+                bname = bname_m.group(1).strip().strip('"').strip() if bname_m else ''
 
-        x, y = 0.0, 0.0
-        if pos:
-            nums = re.findall(r'[-\d.]+', pos)
-            if len(nums) >= 2:
-                try:
-                    x, y = float(nums[0]), float(nums[1])
-                except:
-                    pass
+                x, y = 0.0, 0.0
+                if pos_m:
+                    nums = re.findall(r'[-\d.]+', pos_m.group(1))
+                    if len(nums) >= 2:
+                        try: x, y = float(nums[0]), float(nums[1])
+                        except: pass
 
-        params = {}
-        for line in bc.split('\n'):
-            line = line.strip()
-            if not line or '{' in line or '}' in line:
-                continue
-            parts = line.split(None, 1)
-            if len(parts) == 2:
-                k = parts[0].strip()
-                v = parts[1].strip().strip('"')
-                params[k] = v
+                params = {}
+                for line in bc.split('\n'):
+                    line = line.strip()
+                    if not line or '{' in line or '}' in line: continue
+                    parts = line.split(None, 1)
+                    if len(parts) == 2:
+                        k = parts[0].strip()
+                        v = parts[1].strip().strip('"')
+                        params[k] = v
 
-        bid = nid()
-        bname = bname or f'Block_{bid}'
-        btype = _normalize(btype)
+                bid = nid()
+                bname = bname or f'Block_{bid}'
+                btype = _normalize(btype)
 
-        blocks.append({
-            'id':     bid,
-            'type':   btype,
-            'name':   bname,
-            'x':      x,
-            'y':      y,
-            'params': params
-        })
+                blocks.append({
+                    'id': bid, 'type': btype, 'name': bname,
+                    'x': x, 'y': y, 'params': params
+                })
 
-    # ---- Build name -> id map (with stripped/normalized names) ----
+        pos = abs_start + 1
+
+    # ---- Build name->id map with all variants ----
     name_to_id = {}
     for b in blocks:
-        # Store multiple variants of the name for fuzzy matching
-        raw   = b['name']
-        clean = raw.strip()
-        name_to_id[raw]   = b['id']
+        raw = b['name']
+        name_to_id[raw] = b['id']
+        name_to_id[raw.strip()] = b['id']
+        # Also store without newline escapes
+        clean = raw.replace('\\n', ' ').replace('\n', ' ').strip()
         name_to_id[clean] = b['id']
 
     def resolve(name):
+        if not name: return None
         name = str(name).strip().strip('"')
-        if name in name_to_id:
-            return name_to_id[name]
-        # Try stripped version
-        stripped = name.strip()
-        if stripped in name_to_id:
-            return name_to_id[stripped]
+        if name in name_to_id: return name_to_id[name]
+        clean = name.replace('\\n', ' ').replace('\n', ' ').strip()
+        if clean in name_to_id: return name_to_id[clean]
+        # Try partial match
+        for k, v in name_to_id.items():
+            if k.strip() == name.strip(): return v
         return None
 
-    # ---- Parse Line connections ----
-    line_pattern = re.compile(
-        r'Line\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}',
-        re.DOTALL
-    )
-
-    for lm in line_pattern.finditer(content):
+    # ---- Parse ALL Line connections ----
+    for lm in re.finditer(r'\bLine\s*\{(.*?)\n\s*\}', content, re.DOTALL):
         lc = lm.group(1)
-        src_name = _val(lc, 'SrcBlock')
-        dst_name = _val(lc, 'DstBlock')
-
-        if src_name and dst_name:
-            src_id = resolve(src_name)
-            dst_id = resolve(dst_name)
-            if src_id and dst_id and src_id != dst_id:
-                connections.append({'from': src_id, 'to': dst_id})
-
+        src = _val(lc, 'SrcBlock')
+        dst = _val(lc, 'DstBlock')
+        if src and dst:
+            sid = resolve(src)
+            did = resolve(dst)
+            if sid and did and sid != did:
+                connections.append({'from': sid, 'to': did})
         # Branch connections
-        for bm in re.finditer(r'Branch\s*\{([^{}]*)\}', lc, re.DOTALL):
+        for bm in re.finditer(r'Branch\s*\{(.*?)\}', lc, re.DOTALL):
             dst2 = _val(bm.group(1), 'DstBlock')
-            if src_name and dst2:
-                src_id = resolve(src_name)
-                dst_id = resolve(dst2)
-                if src_id and dst_id and src_id != dst_id:
-                    connections.append({'from': src_id, 'to': dst_id})
+            if src and dst2:
+                sid = resolve(src)
+                did = resolve(dst2)
+                if sid and did and sid != did:
+                    connections.append({'from': sid, 'to': did})
 
-    # Remove duplicate connections
-    seen = set()
-    unique = []
+    # Deduplicate
+    seen, unique = set(), []
     for c in connections:
-        key = (c['from'], c['to'])
-        if key not in seen:
-            seen.add(key)
+        k = (c['from'], c['to'])
+        if k not in seen:
+            seen.add(k)
             unique.append(c)
 
     return blocks, unique
 
 
 def _normalize(btype):
-    m = {
+    return {
         'S-Function': 'SFunction', 'S-function': 'SFunction',
-        'ComplexToRealImag': 'ComplexToRealImag',
-        'RealImagToComplex': 'RealImagToComplex',
-        'Concatenate': 'Concatenate',
-        'DiscretePulseGenerator': 'DiscretePulseGenerator',
-        'RelationalOperator': 'RelationalOperator',
-        'Math': 'MathFunction',
-        'Trigonometry': 'Trigonometry',
+        'Math': 'MathFunction', 'Trigonometry': 'Trigonometry',
         'Logic': 'LogicOperator',
-        'ToWorkspace': 'ToWorkspace',
-        'FromWorkspace': 'FromWorkspace',
-        'DataTypeConversion': 'DataTypeConversion',
-        'DiscreteFilter': 'DiscreteFilter',
-        'DiscreteTransferFcn': 'DiscreteTransferFcn',
-        'UnitDelay': 'UnitDelay',
-        'ZeroOrderHold': 'ZeroOrderHold',
-        'Quantizer': 'Quantizer',
-        'Memory': 'Memory',
-        'BusCreator': 'BusCreator',
-        'BusSelector': 'BusSelector',
-        'MultiPortSwitch': 'MultiPortSwitch',
-        'Selector': 'Selector',
-        'Reshape': 'Reshape',
-        'DotProduct': 'DotProduct',
-        'Display': 'Display',
-        'Terminator': 'Terminator',
-        'Goto': 'Goto',
-        'From': 'From',
-        'EnablePort': 'EnablePort',
-        'Merge': 'Merge',
-    }
-    return m.get(btype, btype)
+    }.get(btype, btype)
 
 
 def _val(content, key):
-    m = re.search(
-        rf'^\s*{re.escape(key)}\s+"?([^"\n]+)"?\s*$',
-        content, re.MULTILINE
-    )
+    m = re.search(rf'^\s*{re.escape(key)}\s+"?([^"\n]+)"?\s*$', content, re.MULTILINE)
     return m.group(1).strip().strip('"') if m else None
