@@ -1,10 +1,11 @@
 // ================================================
-// SimToC — Frontend Script
+// SimToC — Frontend Script v3
 // ================================================
 const API = 'https://simtoc-converter.onrender.com';
 
 let currentCode = '';
 let selectedFile = null;
+let zoomBehavior = null;
 
 // ---- Init ----
 document.addEventListener('DOMContentLoaded', () => {
@@ -17,18 +18,18 @@ document.addEventListener('DOMContentLoaded', () => {
   setInterval(checkStatus, 30000);
 });
 
-// ---- Status Check ----
+// ---- Status ----
 async function checkStatus() {
   const dot  = document.getElementById('status-dot');
   const text = document.getElementById('status-text');
   try {
     const r = await fetch(`${API}/health`, { signal: AbortSignal.timeout(8000) });
     if (r.ok) {
-      dot.className  = 'status-dot online';
+      dot.className    = 'status-dot online';
       text.textContent = 'Backend Online';
-    } else { throw new Error(); }
+    } else throw new Error();
   } catch {
-    dot.className  = 'status-dot offline';
+    dot.className    = 'status-dot offline';
     text.textContent = 'Backend Offline';
   }
 }
@@ -49,82 +50,76 @@ function setupDrop() {
 function handleFile(file) {
   const allowed = ['slx','mdl','pdf','png','jpg','jpeg','bmp'];
   const ext = file.name.split('.').pop().toLowerCase();
-  if (!allowed.includes(ext)) { toast('Unsupported file type!', true); return; }
-
+  if (!allowed.includes(ext)) { showToast('Unsupported file type!', true); return; }
   selectedFile = file;
   document.getElementById('drop-zone').style.display = 'none';
-  const info = document.getElementById('file-info');
-  info.style.display = 'flex';
-  document.getElementById('file-name').textContent = file.name;
-  document.getElementById('file-size').textContent = formatSize(file.size);
-  document.getElementById('btn-convert').disabled = false;
+  document.getElementById('file-info').style.display = 'flex';
+  document.getElementById('file-name').textContent   = file.name;
+  document.getElementById('file-size').textContent   = formatSize(file.size);
+  document.getElementById('btn-convert').disabled    = false;
 }
 
 function clearFile() {
   selectedFile = null;
   document.getElementById('drop-zone').style.display = 'block';
   document.getElementById('file-info').style.display = 'none';
-  document.getElementById('btn-convert').disabled = true;
-  document.getElementById('file-input').value = '';
+  document.getElementById('btn-convert').disabled    = true;
+  document.getElementById('file-input').value        = '';
 }
 
-function formatSize(bytes) {
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
-  return (bytes/1024/1024).toFixed(1) + ' MB';
+function formatSize(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  return (b/1048576).toFixed(1) + ' MB';
 }
 
 // ---- Convert ----
 async function convertFile() {
   if (!selectedFile) return;
-
   const btn  = document.getElementById('btn-convert');
-  const text = document.getElementById('btn-text');
+  const txt  = document.getElementById('btn-text');
   btn.disabled = true;
   btn.classList.add('loading');
-  text.textContent = '⏳ Converting...';
+  txt.textContent = '⏳ Converting...';
 
-  // Hide previous results
   document.getElementById('diagram-empty').style.display = 'flex';
-  document.getElementById('diagram-svg').style.display = 'none';
-  document.getElementById('code-empty').style.display = 'flex';
-  document.getElementById('code-output').style.display = 'none';
-  document.getElementById('stats-grid').style.display = 'none';
+  document.getElementById('diagram-svg').style.display   = 'none';
+  document.getElementById('code-empty').style.display    = 'flex';
+  document.getElementById('code-output').style.display   = 'none';
+  document.getElementById('stats-grid').style.display    = 'none';
 
   try {
     const fd = new FormData();
     fd.append('file', selectedFile);
-
     const r = await fetch(`${API}/convert`, { method: 'POST', body: fd });
     if (!r.ok) {
       const err = await r.json().catch(() => ({ error: 'Server error' }));
       throw new Error(err.error || `HTTP ${r.status}`);
     }
-
     const data = await r.json();
     if (data.error) throw new Error(data.error);
-
     displayResults(data);
-    toast('✅ Conversion successful!');
+    showToast('✅ Conversion successful!');
   } catch (e) {
-    toast(`❌ ${e.message}`, true);
+    showToast(`❌ ${e.message}`, true);
     console.error(e);
   } finally {
     btn.disabled = false;
     btn.classList.remove('loading');
-    text.textContent = '⚡ Convert to C';
+    txt.textContent = '⚡ Convert to C';
   }
 }
 
 // ---- Display Results ----
 function displayResults(data) {
   currentCode = data.c_code || '';
+  const blocks = data.blocks || [];
+  const conns  = data.connections || [];
 
   // Stats
-  const lines = currentCode.split('\n').length;
-  document.getElementById('stat-blocks').textContent = (data.blocks || []).length;
-  document.getElementById('stat-conns').textContent  = (data.connections || []).length;
-  document.getElementById('stat-lines').textContent  = lines;
+  document.getElementById('stat-blocks').textContent = blocks.length;
+  document.getElementById('stat-conns').textContent  = conns.length;
+  document.getElementById('stat-lines').textContent  = currentCode.split('\n').length;
   document.getElementById('stats-grid').style.display = 'grid';
 
   // Code
@@ -137,218 +132,256 @@ function displayResults(data) {
   }
 
   // Diagram
-  if (data.blocks && data.blocks.length > 0) {
+  if (blocks.length > 0) {
     document.getElementById('diagram-empty').style.display = 'none';
     document.getElementById('diagram-svg').style.display   = 'block';
-    renderDiagram(data.blocks, data.connections || []);
+    renderDiagram(blocks, conns);
   }
 }
 
-// ---- D3 Diagram ----
-let svgEl, zoomBehavior;
+// ================================================================
+// D3 Diagram — non-overlapping layout
+// ================================================================
 
 function renderDiagram(blocks, connections) {
-  const container = document.getElementById('diagram-container');
-  const W = container.clientWidth;
-  const H = container.clientHeight;
-
   const svg = d3.select('#diagram-svg');
   svg.selectAll('*').remove();
 
-  // Arrow marker
+  const NODE_W  = 110;
+  const NODE_H  = 38;
+  const PAD_X   = 60;   // horizontal gap between layers
+  const PAD_Y   = 16;   // vertical gap between nodes in same layer
+
+  // ---- Arrow marker ----
   svg.append('defs').append('marker')
-    .attr('id', 'arrow')
-    .attr('viewBox', '0 -5 10 10')
-    .attr('refX', 10).attr('refY', 0)
-    .attr('markerWidth', 6).attr('markerHeight', 6)
+    .attr('id', 'arr')
+    .attr('viewBox', '0 -4 8 8')
+    .attr('refX', 8).attr('refY', 0)
+    .attr('markerWidth', 5).attr('markerHeight', 5)
     .attr('orient', 'auto')
     .append('path')
-    .attr('d', 'M0,-5L10,0L0,5')
-    .attr('fill', 'rgba(0,212,255,0.7)');
+    .attr('d', 'M0,-4L8,0L0,4')
+    .attr('fill', 'rgba(0,212,255,0.8)');
 
   const g = svg.append('g').attr('class', 'zoom-group');
 
   zoomBehavior = d3.zoom()
-    .scaleExtent([0.1, 4])
+    .scaleExtent([0.05, 4])
     .on('zoom', e => g.attr('transform', e.transform));
   svg.call(zoomBehavior);
 
-  // Layout: use positions from MDL if available, else auto-layout
-  const NODE_W = 100;
-  const NODE_H = 36;
-  const PAD_X  = 140;
-  const PAD_Y  = 60;
+  // ---- Compute layers (Sugiyama-style) ----
+  const idMap = {};
+  blocks.forEach(b => { idMap[String(b.id)] = b; });
 
-  // Check if we have real positions
-  const hasPositions = blocks.some(b => b.x !== 0 || b.y !== 0);
+  // Build adjacency
+  const outEdges = {};
+  const inCount  = {};
+  blocks.forEach(b => { outEdges[String(b.id)] = []; inCount[String(b.id)] = 0; });
+  connections.forEach(c => {
+    const s = String(c.from), d = String(c.to);
+    if (outEdges[s] && inCount[d] !== undefined) {
+      outEdges[s].push(d);
+      inCount[d]++;
+    }
+  });
 
-  let nodeMap = {};
-  let positions = {};
+  // Topological sort → assign layers
+  const layer = {};
+  const queue = Object.keys(inCount).filter(id => inCount[id] === 0);
+  const visited = new Set(queue);
+  queue.forEach(id => { layer[id] = 0; });
 
-  if (hasPositions) {
-    // Use real positions but scale them
-    const xs = blocks.map(b => b.x);
-    const ys = blocks.map(b => b.y);
-    const minX = Math.min(...xs), maxX = Math.max(...xs);
-    const minY = Math.min(...ys), maxY = Math.max(...ys);
-    const rangeX = maxX - minX || 1;
-    const rangeY = maxY - minY || 1;
+  let qi = 0;
+  while (qi < queue.length) {
+    const cur = queue[qi++];
+    const curLayer = layer[cur] || 0;
+    (outEdges[cur] || []).forEach(nb => {
+      layer[nb] = Math.max(layer[nb] || 0, curLayer + 1);
+      if (!visited.has(nb)) {
+        visited.add(nb);
+        queue.push(nb);
+      }
+    });
+  }
 
-    blocks.forEach(b => {
-      positions[b.id] = {
-        x: 60 + ((b.x - minX) / rangeX) * (W - 200),
-        y: 40 + ((b.y - minY) / rangeY) * (H - 100)
+  // Unvisited nodes (disconnected) — put at end
+  blocks.forEach(b => {
+    const id = String(b.id);
+    if (layer[id] === undefined) layer[id] = 0;
+  });
+
+  // Group nodes by layer
+  const layerGroups = {};
+  blocks.forEach(b => {
+    const l = layer[String(b.id)] || 0;
+    if (!layerGroups[l]) layerGroups[l] = [];
+    layerGroups[l].push(b);
+  });
+
+  const numLayers = Math.max(...Object.keys(layerGroups).map(Number)) + 1;
+
+  // ---- Sort nodes within each layer to minimise crossings ----
+  // Simple barycenter heuristic
+  Object.keys(layerGroups).forEach(li => {
+    const l = Number(li);
+    if (l === 0) return;
+    layerGroups[li].sort((a, b) => {
+      const aid = String(a.id), bid = String(b.id);
+      const aParents = connections.filter(c => String(c.to) === aid).map(c => String(c.from));
+      const bParents = connections.filter(c => String(c.to) === bid).map(c => String(c.from));
+      const aPos = aParents.length
+        ? aParents.reduce((s, pid) => s + (layerGroups[l-1]?.findIndex(n => String(n.id) === pid) || 0), 0) / aParents.length
+        : 0;
+      const bPos = bParents.length
+        ? bParents.reduce((s, pid) => s + (layerGroups[l-1]?.findIndex(n => String(n.id) === pid) || 0), 0) / bParents.length
+        : 0;
+      return aPos - bPos;
+    });
+  });
+
+  // ---- Assign pixel positions ----
+  const pos = {};
+  Object.keys(layerGroups).forEach(li => {
+    const l     = Number(li);
+    const nodes = layerGroups[li];
+    const totalH = nodes.length * NODE_H + (nodes.length - 1) * PAD_Y;
+    nodes.forEach((b, i) => {
+      pos[String(b.id)] = {
+        x: 40 + l * (NODE_W + PAD_X),
+        y: 40 + i * (NODE_H + PAD_Y)
       };
     });
-  } else {
-    // Auto layout: left to right by topological order
-    const inDeg = {};
-    blocks.forEach(b => inDeg[b.id] = 0);
-    connections.forEach(c => { if (inDeg[c.to] !== undefined) inDeg[c.to]++; });
+  });
 
-    const layers = [];
-    let remaining = [...blocks];
-    let placed = new Set();
-
-    while (remaining.length > 0) {
-      const layer = remaining.filter(b => inDeg[b.id] === 0 && !placed.has(b.id));
-      if (layer.length === 0) { // break cycles
-        const fallback = remaining.filter(b => !placed.has(b.id));
-        if (fallback.length) { layers.push([fallback[0]]); placed.add(fallback[0].id); }
-        break;
-      }
-      layers.push(layer);
-      layer.forEach(b => {
-        placed.add(b.id);
-        connections.filter(c => c.from === b.id).forEach(c => {
-          if (inDeg[c.to] !== undefined) inDeg[c.to]--;
-        });
-      });
-      remaining = remaining.filter(b => !placed.has(b.id));
-    }
-
-    layers.forEach((layer, li) => {
-      layer.forEach((b, bi) => {
-        positions[b.id] = {
-          x: 60 + li * PAD_X,
-          y: 40 + bi * PAD_Y
-        };
-      });
-    });
-  }
-
-  blocks.forEach(b => { nodeMap[b.id] = b; });
-
-  // Block color by type
-  function blockColor(type) {
+  // ---- Block colours by type ----
+  function fillColor(type) {
     const t = (type || '').toLowerCase();
-    if (['inport','in'].includes(t))         return '#1a4a2e';
-    if (['outport','out'].includes(t))        return '#2e1a4a';
-    if (['gain','product','sum'].includes(t)) return '#1a2e4a';
-    if (t.includes('integrator') || t.includes('delay') || t.includes('memory')) return '#2e2a1a';
-    if (t.includes('subsystem'))              return '#1e3040';
-    if (t.includes('sfunc') || t.includes('reference')) return '#2e1a1a';
-    if (['constant','step','sinewave'].includes(t)) return '#1a3a2e';
-    return '#1a2235';
+    if (['inport','in'].includes(t))             return '#0d3320';
+    if (['outport','out'].includes(t))            return '#1e0d33';
+    if (['gain','product','sum','dotproduct'].includes(t)) return '#0d1e33';
+    if (t.includes('integrator') || t.includes('derivative') ||
+        t.includes('delay') || t.includes('memory') ||
+        t.includes('zeroorderr'))                 return '#2e2008';
+    if (t.includes('subsystem'))                  return '#0a1e2e';
+    if (t.includes('sfunction') || t === 'sfunction') return '#2e0808';
+    if (t.includes('reference'))                  return '#2a1008';
+    if (['constant','step','sinewave','chirp',
+         'discretepulsegenerator'].includes(t))   return '#0d2a1a';
+    if (t.includes('pid'))                        return '#1a0d2e';
+    if (t.includes('transfer') || t.includes('filter')) return '#1a1a2e';
+    if (t.includes('scope') || t.includes('display') ||
+        t.includes('toworkspace'))                return '#1a1a1a';
+    return '#111827';
   }
-  function blockBorder(type) {
+  function strokeColor(type) {
     const t = (type || '').toLowerCase();
     if (['inport','in'].includes(t))  return '#00ff88';
     if (['outport','out'].includes(t)) return '#aa44ff';
-    if (t.includes('sfunc') || t.includes('reference')) return '#ff4466';
-    if (t.includes('subsystem'))      return '#0099cc';
+    if (t.includes('sfunction'))      return '#ff4466';
+    if (t.includes('reference'))      return '#ff8844';
+    if (t.includes('subsystem'))      return '#00aaff';
+    if (t.includes('pid'))            return '#ff88ff';
+    if (t.includes('transfer') || t.includes('filter')) return '#ffcc44';
     return '#1e3a5a';
   }
 
-  // Draw connections
-  const linkGroup = g.append('g');
+  // ---- Draw edges first (behind nodes) ----
+  const edgeGroup = g.append('g').attr('class', 'edges');
   connections.forEach(c => {
-    const src = positions[c.from];
-    const dst = positions[c.to];
-    if (!src || !dst) return;
+    const sp = pos[String(c.from)];
+    const dp = pos[String(c.to)];
+    if (!sp || !dp) return;
 
-    const x1 = src.x + NODE_W;
-    const y1 = src.y + NODE_H / 2;
-    const x2 = dst.x;
-    const y2 = dst.y + NODE_H / 2;
-    const mx = (x1 + x2) / 2;
+    const x1 = sp.x + NODE_W, y1 = sp.y + NODE_H / 2;
+    const x2 = dp.x - 2,      y2 = dp.y + NODE_H / 2;
+    const mx  = (x1 + x2) / 2;
 
-    linkGroup.append('path')
-      .attr('class', 'link')
+    edgeGroup.append('path')
       .attr('d', `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`)
-      .attr('marker-end', 'url(#arrow)');
+      .attr('fill', 'none')
+      .attr('stroke', 'rgba(0,212,255,0.35)')
+      .attr('stroke-width', 1.2)
+      .attr('marker-end', 'url(#arr)');
   });
 
-  // Draw nodes
-  const nodeGroup = g.append('g');
+  // ---- Draw nodes ----
+  const nodeGroup = g.append('g').attr('class', 'nodes');
   blocks.forEach(b => {
-    const pos = positions[b.id];
-    if (!pos) return;
+    const p = pos[String(b.id)];
+    if (!p) return;
 
     const node = nodeGroup.append('g')
-      .attr('class', 'block-node')
-      .attr('transform', `translate(${pos.x},${pos.y})`)
-      .style('cursor', 'pointer');
+      .attr('transform', `translate(${p.x},${p.y})`)
+      .style('cursor', 'default');
 
+    // background rect
     node.append('rect')
-      .attr('width', NODE_W)
-      .attr('height', NODE_H)
-      .attr('rx', 6)
-      .attr('fill', blockColor(b.type))
-      .attr('stroke', blockBorder(b.type))
+      .attr('width', NODE_W).attr('height', NODE_H)
+      .attr('rx', 5)
+      .attr('fill', fillColor(b.type))
+      .attr('stroke', strokeColor(b.type))
       .attr('stroke-width', 1.5);
 
-    // Type label
+    // type label (small, muted)
+    const typeLabel = (b.type || '').slice(0, 16);
     node.append('text')
-      .attr('x', NODE_W / 2)
-      .attr('y', 13)
+      .attr('x', NODE_W / 2).attr('y', 12)
       .attr('text-anchor', 'middle')
-      .attr('fill', '#88aacc')
-      .attr('font-size', '8px')
-      .text(b.type || '');
+      .attr('fill', '#556688')
+      .attr('font-size', '7.5px')
+      .attr('font-family', 'JetBrains Mono, monospace')
+      .text(typeLabel);
 
-    // Name label (truncated)
-    const name = (b.name || '').replace(/\\n/g, ' ');
+    // name label
+    const rawName = (b.name || '').replace(/\\n|\n/g, ' ').trim();
+    const name = rawName.length > 15 ? rawName.slice(0, 14) + '…' : rawName;
     node.append('text')
-      .attr('x', NODE_W / 2)
-      .attr('y', 27)
+      .attr('x', NODE_W / 2).attr('y', 26)
       .attr('text-anchor', 'middle')
-      .attr('fill', '#e0eeff')
+      .attr('fill', '#d0e8ff')
       .attr('font-size', '9px')
       .attr('font-weight', '600')
-      .text(name.length > 14 ? name.slice(0, 13) + '…' : name);
+      .attr('font-family', 'JetBrains Mono, monospace')
+      .text(name);
 
-    // Tooltip on hover
-    node.append('title').text(`[${b.type}] ${b.name}`);
+    // tooltip
+    node.append('title').text(`[${b.type}]\n${b.name}`);
   });
 
-  // Auto fit
-  setTimeout(() => fitDiagram(), 100);
+  // ---- Fit all into view ----
+  setTimeout(fitDiagram, 120);
 }
 
+// ---- Fit / Reset ----
 function fitDiagram() {
-  const svg = document.getElementById('diagram-svg');
-  const g   = svg.querySelector('.zoom-group');
-  if (!g || !zoomBehavior) return;
+  const svgEl = document.getElementById('diagram-svg');
+  const gEl   = svgEl.querySelector('.zoom-group');
+  if (!gEl || !zoomBehavior) return;
 
-  const svgRect = svg.getBoundingClientRect();
-  const gRect   = g.getBoundingClientRect();
-  if (gRect.width === 0) return;
+  const svgR = svgEl.getBoundingClientRect();
+  const gR   = gEl.getBoundingClientRect();
+  if (gR.width < 1 || gR.height < 1) return;
 
-  const scaleX = (svgRect.width  - 80) / gRect.width;
-  const scaleY = (svgRect.height - 80) / gRect.height;
-  const scale  = Math.min(scaleX, scaleY, 2);
+  const scaleX = (svgR.width  - 80) / gR.width;
+  const scaleY = (svgR.height - 80) / gR.height;
+  const scale  = Math.min(scaleX, scaleY, 1.5);
 
-  const tx = (svgRect.width  - gRect.width  * scale) / 2;
-  const ty = (svgRect.height - gRect.height * scale) / 2;
+  // centre the diagram
+  const tx = (svgR.width  - gR.width  * scale) / 2 - gR.left * scale + svgR.left * scale;
+  const ty = (svgR.height - gR.height * scale) / 2 - gR.top  * scale + svgR.top  * scale;
 
-  d3.select('#diagram-svg').transition().duration(400)
-    .call(zoomBehavior.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
+  d3.select('#diagram-svg')
+    .transition().duration(500)
+    .call(zoomBehavior.transform,
+          d3.zoomIdentity.translate(tx, ty).scale(scale));
 }
 
 function resetZoom() {
-  d3.select('#diagram-svg').transition().duration(400)
-    .call(zoomBehavior.transform, d3.zoomIdentity);
+  if (!zoomBehavior) return;
+  d3.select('#diagram-svg')
+    .transition().duration(400)
+    .call(zoomBehavior.transform, d3.zoomIdentity.translate(40, 40).scale(1));
 }
 
 // ---- Copy & Download ----
@@ -356,10 +389,8 @@ async function copyCode() {
   if (!currentCode) return;
   try {
     await navigator.clipboard.writeText(currentCode);
-    toast('📋 Code copied to clipboard!');
-  } catch {
-    toast('❌ Copy failed', true);
-  }
+    showToast('📋 Copied to clipboard!');
+  } catch { showToast('❌ Copy failed', true); }
 }
 
 function downloadCode() {
@@ -371,11 +402,11 @@ function downloadCode() {
   a.download = `${name}_output.c`;
   a.click();
   URL.revokeObjectURL(a.href);
-  toast('⬇ Downloading...');
+  showToast('⬇ Downloading...');
 }
 
 // ---- Toast ----
-function toast(msg, isError = false) {
+function showToast(msg, isError = false) {
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.style.borderColor = isError ? 'var(--red)' : 'var(--cyan)';
@@ -386,38 +417,37 @@ function toast(msg, isError = false) {
 // ---- Background Particles ----
 function initParticles() {
   const canvas = document.getElementById('bg-canvas');
-  const ctx = canvas.getContext('2d');
-  canvas.width  = window.innerWidth;
-  canvas.height = window.innerHeight;
+  const ctx    = canvas.getContext('2d');
 
-  const particles = Array.from({ length: 60 }, () => ({
+  function resize() {
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  const pts = Array.from({ length: 55 }, () => ({
     x: Math.random() * canvas.width,
     y: Math.random() * canvas.height,
-    vx: (Math.random() - 0.5) * 0.3,
-    vy: (Math.random() - 0.5) * 0.3,
-    r:  Math.random() * 1.5 + 0.5,
-    a:  Math.random()
+    vx: (Math.random() - 0.5) * 0.25,
+    vy: (Math.random() - 0.5) * 0.25,
+    r: Math.random() * 1.4 + 0.4,
+    a: Math.random() * 0.5 + 0.1,
   }));
 
-  function draw() {
+  (function draw() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    particles.forEach(p => {
+    pts.forEach(p => {
       p.x += p.vx; p.y += p.vy;
       if (p.x < 0) p.x = canvas.width;
-      if (p.x > canvas.width) p.x = 0;
+      if (p.x > canvas.width)  p.x = 0;
       if (p.y < 0) p.y = canvas.height;
       if (p.y > canvas.height) p.y = 0;
       ctx.beginPath();
       ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(0,212,255,${p.a * 0.4})`;
+      ctx.fillStyle = `rgba(0,212,255,${p.a * 0.35})`;
       ctx.fill();
     });
     requestAnimationFrame(draw);
-  }
-  draw();
-
-  window.addEventListener('resize', () => {
-    canvas.width  = window.innerWidth;
-    canvas.height = window.innerHeight;
-  });
+  })();
 }
