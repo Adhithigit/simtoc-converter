@@ -470,9 +470,14 @@ def _block_to_c(bt, bn, out, in0, ins, p):
         terms = []
         for i, sig in enumerate(ins):
             s = signs[i] if i < len(signs) else '+'
-            terms.append(f"- {sig}" if s == '-' else sig)
-        expr = ' + '.join(terms) if terms else in0
-        return [f"{out} = {expr};"]
+            if i == 0:
+                # first term: just negate if minus, else plain
+                terms.append(f"-{sig}" if s == '-' else sig)
+            else:
+                # subsequent terms: prefix with operator
+                terms.append(f"- {sig}" if s == '-' else f"+ {sig}")
+        expr = ' '.join(terms) if terms else in0
+        return [f"{out} = {expr};  /* Sum: {signs} */"]
 
     # ---- Product  (y = u1*u2 or u1/u2) ----
     if bt == 'Product':
@@ -1014,3 +1019,188 @@ def _topo(blocks, conn_map):
     for b in blocks:
         if str(b['id']) not in seen: order.append(b)
     return order
+
+
+
+# ================================================================
+# generate_simple_c_code()
+# For purely combinational models — produces clean direct C
+# ================================================================
+
+def generate_simple_c_code(blocks, connections):
+    state_types = {
+        'Integrator','Derivative','UnitDelay','ZeroOrderHold',
+        'TransferFcn','DiscreteTransferFcn','DiscreteFilter',
+        'PIDController','Memory','RateLimiter','SineWave','Step',
+        'DiscretePulseGenerator','DiscreteStateSpace'
+    }
+    has_state  = any(b['type'] in state_types for b in blocks)
+    has_inport = any(b['type'] in ('Inport','In') for b in blocks)
+    if has_state or has_inport:
+        return None
+
+    block_by_id   = {str(b['id']): b for b in blocks}
+    block_by_name = {b['name']: b for b in blocks}
+
+    norm = []
+    for c in connections:
+        s = str(c.get('from',''))
+        d = str(c.get('to',''))
+        if not s.isdigit() and s in block_by_name:
+            s = str(block_by_name[s]['id'])
+        if not d.isdigit() and d in block_by_name:
+            d = str(block_by_name[d]['id'])
+        if s and d and s != d:
+            norm.append({'from':s,'to':d,'dst_port':c.get('dst_port',1)})
+
+    conn_map = {}
+    in_map   = {}
+    for c in norm:
+        conn_map.setdefault(c['from'],[]).append(c['to'])
+        in_map.setdefault(c['to'],[]).append((c['from'], c['dst_port']))
+
+    ordered = _topo(blocks, conn_map)
+
+    lines = [
+        "/*",
+        " * ================================================",
+        " * Auto-generated C Code — SimToC Converter",
+        " * Model type: Combinational (no time dependency)",
+        " * ================================================",
+        " */",
+        "#include <stdio.h>",
+        "#include <math.h>",
+        "",
+        "typedef double Signal;",
+        "",
+    ]
+
+    # Declare constants
+    const_blocks = [b for b in blocks if b['type'] == 'Constant']
+    if const_blocks:
+        lines.append("/* Constants from Simulink Constant blocks */")
+        for b in const_blocks:
+            v    = b['params'].get('Value','1.0')
+            nums = re.findall(r'[-\d.eE+]+', v)
+            val  = nums[0] if nums else v
+            lines.append(f"#define {_sn(b['name']).upper()} ({val})")
+        lines.append("")
+
+    # Gain constants
+    gain_blocks = [b for b in blocks if b['type'] == 'Gain']
+    if gain_blocks:
+        lines.append("/* Gain values */")
+        for b in gain_blocks:
+            v    = b['params'].get('Gain','1.0')
+            nums = re.findall(r'[-\d.eE+]+', v)
+            val  = nums[0] if nums else '1.0'
+            lines.append(f"static const Signal GAIN_{_sn(b['name']).upper()} = {val};")
+        lines.append("")
+
+    lines += ["int main(void) {",""]
+
+    for b in ordered:
+        bid = str(b['id'])
+        bt  = b['type']
+        bn  = _sn(b['name'])
+        bp  = b.get('params',{})
+
+        # Get inputs sorted by port number
+        raw_ins = sorted(in_map.get(bid,[]), key=lambda x: x[1])
+        insigs  = []
+        for src_id, _ in raw_ins:
+            sb = block_by_id.get(src_id)
+            if sb:
+                insigs.append(f"sig_{_sn(sb['name'])}")
+
+        in0 = insigs[0] if insigs else "0.0"
+        out = f"sig_{bn}"
+        lines.append(f"    /* [{bt}] {b['name']} */")
+
+        if bt == 'Constant':
+            v    = bp.get('Value','1.0')
+            nums = re.findall(r'[-\d.eE+]+', v)
+            val  = nums[0] if nums else v
+            lines.append(f"    Signal {out} = {val};")
+
+        elif bt == 'Gain':
+            lines.append(f"    Signal {out} = GAIN_{bn.upper()} * {in0};")
+
+        elif bt == 'Sum':
+            signs_raw = str(bp.get('Inputs', bp.get('Signs', '++')))
+            signs = ''.join(c for c in signs_raw if c in '+-')
+            if not signs:
+                signs = '+' * max(len(insigs), 1)
+            # Build expression cleanly
+            terms = []
+            for i, sig in enumerate(insigs):
+                s = signs[i] if i < len(signs) else '+'
+                if i == 0:
+                    terms.append(f"-{sig}" if s == '-' else sig)
+                else:
+                    terms.append(f"- {sig}" if s == '-' else f"+ {sig}")
+            expr = ' '.join(terms) if terms else '0.0'
+            lines.append(f"    Signal {out} = {expr};")
+
+        elif bt == 'Product':
+            op_str = bp.get('Inputs','**')
+            if '/' in op_str and len(insigs) >= 2:
+                lines.append(f"    Signal {out} = ({insigs[1]} != 0.0) ? {insigs[0]} / {insigs[1]} : 0.0;")
+            else:
+                expr = ' * '.join(insigs) if len(insigs) >= 2 else f"{in0} * {in0}"
+                lines.append(f"    Signal {out} = {expr};")
+
+        elif bt == 'Abs':
+            lines.append(f"    Signal {out} = fabs({in0});")
+
+        elif bt == 'Sqrt':
+            lines.append(f"    Signal {out} = sqrt(fabs({in0}));")
+
+        elif bt == 'MathFunction':
+            op = bp.get('Operator', bp.get('Function','exp')).lower()
+            fn_map = {
+                'square': f"({in0})*({in0})",
+                'sqrt':   f"sqrt(fabs({in0}))",
+                'exp':    f"exp({in0})",
+                'log':    f"log(fabs({in0})+1e-300)",
+                'log10':  f"log10(fabs({in0})+1e-300)",
+                'floor':  f"floor({in0})",
+                'ceil':   f"ceil({in0})",
+                'round':  f"round({in0})",
+                'sign':   f"(({in0}>0.0)-({in0}<0.0))",
+                'pow':    f"pow({in0},{insigs[1] if len(insigs)>1 else '2.0'})",
+            }
+            lines.append(f"    Signal {out} = {fn_map.get(op, f'{op}({in0})')};")
+
+        elif bt == 'Trigonometry':
+            op = bp.get('Operator','sin').lower()
+            fn_map = {
+                'sin':  f"sin({in0})",   'cos': f"cos({in0})",
+                'tan':  f"tan({in0})",   'asin': f"asin(fmax(-1.0,fmin(1.0,{in0})))",
+                'acos': f"acos(fmax(-1.0,fmin(1.0,{in0})))", 'atan': f"atan({in0})",
+                'atan2':f"atan2({insigs[0]},{insigs[1] if len(insigs)>1 else '1.0'})",
+            }
+            lines.append(f"    Signal {out} = {fn_map.get(op, f'sin({in0})')};")
+
+        elif bt == 'Saturation':
+            hi = _sf(bp.get('UpperLimit','1.0'),'1.0')
+            lo = _sf(bp.get('LowerLimit','-1.0'),'-1.0')
+            lines.append(f"    Signal {out} = fmax({lo}, fmin({hi}, {in0}));")
+
+        elif bt in ('Display','Scope'):
+            lines.append(f'    printf("{b["name"]} = %g\\n", (double){in0});')
+            lines.append(f"    Signal {out} = {in0};")
+
+        elif bt == 'Terminator':
+            lines.append(f"    (void){in0};")
+
+        elif bt in ('Outport','Out'):
+            lines.append(f'    printf("Output [{b["name"]}] = %g\\n", (double){in0});')
+
+        else:
+            lines.append(f"    Signal {out} = {in0};")
+
+        lines.append("")
+
+    lines += ["    return 0;", "}"]
+    return '\n'.join(lines)

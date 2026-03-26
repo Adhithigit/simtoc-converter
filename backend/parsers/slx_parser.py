@@ -1,5 +1,6 @@
 import zipfile
 import xml.etree.ElementTree as ET
+import re
 
 def parse_slx(filepath):
     blocks = []
@@ -10,78 +11,106 @@ def parse_slx(filepath):
         counter[0] += 1
         return str(counter[0])
 
-    try:
-        with zipfile.ZipFile(filepath, 'r') as z:
-            xml_files = [f for f in z.namelist() if f.endswith('.xml')]
+    with zipfile.ZipFile(filepath, 'r') as z:
+        system_files = [f for f in z.namelist() if f.startswith('simulink/systems/') and f.endswith('.xml')]
+        
+        for sfile in system_files:
+            with z.open(sfile) as f:
+                content = f.read().decode('utf-8', errors='ignore')
+            
+            try:
+                root = ET.fromstring(content)
+            except:
+                continue
 
-            for xml_file in xml_files:
-                with z.open(xml_file) as f:
-                    content = f.read()
-                try:
-                    root = ET.fromstring(content)
-                    for elem in root.iter():
-                        tag = elem.tag.lower()
+            # SID -> internal id map
+            sid_to_id = {}
 
-                        if 'block' in tag and elem.get('BlockType'):
-                            block_type = elem.get('BlockType', 'Unknown')
-                            block_name = elem.get('Name', f'Block_{counter[0]}')
-                            x, y = 0.0, 0.0
+            # Parse all Block elements
+            for block in root.findall('.//Block'):
+                btype = block.get('BlockType', '')
+                bname = block.get('Name', '')
+                sid   = block.get('SID', '')
 
-                            pos = elem.find('.//P[@Name="Position"]')
-                            if pos is not None and pos.text:
-                                try:
-                                    coords = pos.text.strip('[]').split(',')
-                                    if len(coords) >= 2:
-                                        x = float(coords[0].strip())
-                                        y = float(coords[1].strip())
-                                except:
-                                    pass
+                x, y = 0.0, 0.0
+                pos_el = block.find("P[@Name='Position']")
+                if pos_el is not None and pos_el.text:
+                    nums = re.findall(r'[-\d.]+', pos_el.text)
+                    if len(nums) >= 2:
+                        try: x, y = float(nums[0]), float(nums[1])
+                        except: pass
 
-                            params = {}
-                            for p in elem.findall('.//P'):
-                                pname = p.get('Name', '')
-                                if pname and p.text:
-                                    params[pname] = p.text.strip()
+                # Extract all parameters
+                params = {}
+                for p in block.findall('P'):
+                    pname = p.get('Name', '')
+                    ptext = (p.text or '').strip()
+                    if pname:
+                        params[pname] = ptext
 
-                            blocks.append({
-                                'id': nid(),
-                                'type': block_type,
-                                'name': block_name,
-                                'x': x,
-                                'y': y,
-                                'params': params
-                            })
+                bid = nid()
+                if sid:
+                    sid_to_id[sid] = bid
 
-                        if 'line' in tag:
-                            src = elem.get('Src', '')
-                            dst = elem.get('Dst', '')
-                            if src and dst:
-                                connections.append({'from': src, 'to': dst})
+                btype = _normalize(btype)
+                blocks.append({
+                    'id':     bid,
+                    'type':   btype,
+                    'name':   bname,
+                    'x':      x,
+                    'y':      y,
+                    'params': params
+                })
 
-                except ET.ParseError:
+            # Parse all Line connections (SID-based: "1#out:1" -> "3#in:1")
+            for line in root.findall('.//Line'):
+                src_el = line.find("P[@Name='Src']")
+                dst_el = line.find("P[@Name='Dst']")
+                if src_el is None or dst_el is None:
                     continue
 
-    except zipfile.BadZipFile:
-        raise ValueError("Invalid .slx file — file may be corrupted.")
+                src_str = (src_el.text or '').strip()
+                dst_str = (dst_el.text or '').strip()
 
-    if not blocks:
-        blocks = _sample_blocks()
-        connections = _sample_connections()
+                # Parse "SID#out:port" or "SID#in:port"
+                src_sid = src_str.split('#')[0] if '#' in src_str else src_str
+                dst_sid = dst_str.split('#')[0] if '#' in dst_str else dst_str
 
-    return blocks, connections
+                src_id = sid_to_id.get(src_sid)
+                dst_id = sid_to_id.get(dst_sid)
+
+                if src_id and dst_id and src_id != dst_id:
+                    # Get port numbers
+                    src_port = 1
+                    dst_port = 1
+                    if '#out:' in src_str:
+                        try: src_port = int(src_str.split('#out:')[1])
+                        except: pass
+                    if '#in:' in dst_str:
+                        try: dst_port = int(dst_str.split('#in:')[1])
+                        except: pass
+
+                    connections.append({
+                        'from':      src_id,
+                        'to':        dst_id,
+                        'src_port':  src_port,
+                        'dst_port':  dst_port
+                    })
+
+    # Deduplicate
+    seen, unique = set(), []
+    for c in connections:
+        k = (c['from'], c['to'], c.get('dst_port', 1))
+        if k not in seen:
+            seen.add(k)
+            unique.append(c)
+
+    return blocks, unique
 
 
-def _sample_blocks():
-    return [
-        {'id': '1', 'type': 'Inport',      'name': 'Input',   'x': 50,  'y': 100, 'params': {}},
-        {'id': '2', 'type': 'Gain',        'name': 'Gain1',   'x': 200, 'y': 100, 'params': {'Gain': '2.0'}},
-        {'id': '3', 'type': 'Integrator',  'name': 'Int1',    'x': 350, 'y': 100, 'params': {'InitialCondition': '0'}},
-        {'id': '4', 'type': 'Outport',     'name': 'Output',  'x': 500, 'y': 100, 'params': {}},
-    ]
-
-def _sample_connections():
-    return [
-        {'from': '1', 'to': '2'},
-        {'from': '2', 'to': '3'},
-        {'from': '3', 'to': '4'},
-    ]
+def _normalize(btype):
+    return {
+        'S-Function': 'SFunction', 'S-function': 'SFunction',
+        'Math': 'MathFunction', 'Trigonometry': 'Trigonometry',
+        'Logic': 'LogicOperator',
+    }.get(btype, btype)
