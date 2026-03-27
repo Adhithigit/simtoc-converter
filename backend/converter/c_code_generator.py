@@ -6,7 +6,7 @@ from collections import defaultdict, deque
 # Handles both combinational and time-based models correctly
 # ================================================================
 
-def generate_c_code(blocks, connections):
+def generate_c_code(blocks, connections, sim_dt=0.1, sim_stop=10.0):
     """Main entry point — auto-detects model type and generates correct C."""
 
     block_by_id   = {str(b['id']): b for b in blocks}
@@ -56,7 +56,8 @@ def generate_c_code(blocks, connections):
                                   block_by_id, mux_sizes)
     else:
         return _gen_time_based(blocks, ordered, conn_map, in_map,
-                               block_by_id, mux_sizes, has_inport)
+                               block_by_id, mux_sizes, has_inport,
+                               sim_dt=sim_dt, sim_stop=sim_stop)
 
 
 # ================================================================
@@ -129,7 +130,8 @@ def _gen_combinational(blocks, ordered, conn_map, in_map, block_by_id, mux_sizes
 # ================================================================
 
 def _gen_time_based(blocks, ordered, conn_map, in_map,
-                    block_by_id, mux_sizes, has_inport):
+                    block_by_id, mux_sizes, has_inport,
+                    sim_dt=0.1, sim_stop=10.0):
 
     TIME_TYPES = {'Integrator','Derivative','UnitDelay','ZeroOrderHold',
                   'TransferFcn','DiscreteTransferFcn','DiscreteFilter',
@@ -306,8 +308,9 @@ def _gen_time_based(blocks, ordered, conn_map, in_map,
     lines += [
         "int main(void) {",
         "    model_init();",
-        "    const double DT = 0.1;   /* sample period — matches Simulink FixedStep */",
-        "    const double T  = 10.0;  /* simulation stop time */",
+        f"    const double DT = {sim_dt};   /* FixedStep from Simulink model */",
+        f"    const double T  = {sim_stop};  /* StopTime from Simulink model */",
+        
         "    double t = 0.0;",
         "",
     ]

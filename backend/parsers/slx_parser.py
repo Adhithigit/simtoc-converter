@@ -106,7 +106,30 @@ def parse_slx(filepath):
             seen.add(k)
             unique.append(c)
 
-    return blocks, unique
+    # Extract simulation settings from configSet
+    sim_dt   = 0.1
+    sim_stop = 10.0
+    try:
+        with zipfile.ZipFile(filepath, 'r') as z2:
+            cfg_files = [f for f in z2.namelist() if 'configSet' in f and f.endswith('.xml')]
+            if cfg_files:
+                with z2.open(cfg_files[0]) as cf:
+                    cfg = cf.read().decode('utf-8', errors='ignore')
+                import re as _re
+                m = _re.search(r'<P Name="StopTime"[^>]*>([^<]+)</P>', cfg)
+                if m:
+                    try: sim_stop = float(m.group(1).strip())
+                    except: pass
+                m = _re.search(r'<P Name="FixedStep"[^>]*>([^<]+)</P>', cfg)
+                if m:
+                    v = m.group(1).strip()
+                    if v not in ('auto','inf',''):
+                        try: sim_dt = float(v)
+                        except: pass
+    except:
+        pass
+
+    return blocks, unique, sim_dt, sim_stop
 
 
 def _port(s, direction):

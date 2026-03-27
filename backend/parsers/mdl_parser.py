@@ -119,7 +119,27 @@ def parse_mdl(filepath):
             seen.add(k)
             unique.append(c)
 
-    return blocks, unique
+    # Try to extract sim settings from MDL
+    sim_dt   = 0.1
+    sim_stop = 10.0
+    try:
+        import re as _re
+        m = _re.search(r'StopTime\s+"([^"]+)"', content)
+        if m:
+            v = m.group(1).strip()
+            if v not in ('inf','Inf'):
+                try: sim_stop = float(v)
+                except: pass
+        m = _re.search(r'FixedStep\s+"([^"]+)"', content)
+        if m:
+            v = m.group(1).strip()
+            if v not in ('auto','inf','Inf',''):
+                try: sim_dt = float(v)
+                except: pass
+    except:
+        pass
+
+    return blocks, unique, sim_dt, sim_stop
 
 
 def _normalize(btype):

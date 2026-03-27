@@ -34,49 +34,72 @@ def convert():
     file.save(filepath)
 
     try:
+        sim_dt   = 0.1
+        sim_stop = 10.0
+
         if ext == 'slx':
-            blocks, connections = parse_slx(filepath)
+            result = parse_slx(filepath)
+            if len(result) == 4:
+                blocks, connections, sim_dt, sim_stop = result
+            else:
+                blocks, connections = result
+
         elif ext == 'mdl':
-            blocks, connections = parse_mdl(filepath)
+            result = parse_mdl(filepath)
+            if len(result) == 4:
+                blocks, connections, sim_dt, sim_stop = result
+            else:
+                blocks, connections = result
+
         elif ext == 'pdf':
             blocks, connections = parse_pdf(filepath)
+
         elif ext in ['png', 'jpg', 'jpeg', 'bmp']:
             blocks, connections = parse_image(filepath)
+
         else:
             return jsonify({'error': f'Unsupported file type: .{ext}'}), 400
 
-        from converter.c_code_generator import generate_simple_c_code
-        c_code = generate_simple_c_code(blocks, connections)
-        if c_code is None:
-           c_code = generate_c_code(blocks, connections)
+        # Generate C code — auto-detects combinational vs time-based
+        c_code = generate_c_code(
+            blocks,
+            connections,
+            sim_dt=sim_dt,
+            sim_stop=sim_stop
+        )
 
         diagram_data = {
             'blocks': [
                 {
-                    'id': str(b['id']),
+                    'id':   str(b['id']),
                     'type': b['type'],
                     'name': b['name'],
-                    'x': float(b.get('x', 0)),
-                    'y': float(b.get('y', 0))
+                    'x':    float(b.get('x', 0)),
+                    'y':    float(b.get('y', 0))
                 }
                 for b in blocks
             ],
             'connections': [
-                {'from': str(c.get('from', '')), 'to': str(c.get('to', ''))}
+                {
+                    'from': str(c.get('from', '')),
+                    'to':   str(c.get('to',   ''))
+                }
                 for c in connections
             ]
         }
 
         return jsonify({
-            'success': True,
-            'c_code': c_code,
-            'diagram': diagram_data,
-            'block_count': len(blocks),
+            'success':          True,
+            'c_code':           c_code,
+            'blocks':           diagram_data['blocks'],
+            'connections':      diagram_data['connections'],
+            'block_count':      len(blocks),
             'connection_count': len(connections)
         })
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        import traceback
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
 
     finally:
         if os.path.exists(filepath):
@@ -84,4 +107,4 @@ def convert():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    app.run(debug=False, host='0.0.0.0', port=8080)
+    app.run(debug=False, host='0.0.0.0', port=port)
