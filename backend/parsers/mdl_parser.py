@@ -23,7 +23,6 @@ def parse_mdl(filepath):
         abs_start = pos + m.start()
         brace_open = pos + m.end() - 1
 
-        # Find matching closing brace
         depth = 0
         bc = None
         for i in range(brace_open, min(brace_open + 20000, len(content))):
@@ -71,13 +70,12 @@ def parse_mdl(filepath):
 
         pos = abs_start + 1
 
-    # ---- Build name->id map with all variants ----
+    # ---- Build name->id map ----
     name_to_id = {}
     for b in blocks:
         raw = b['name']
         name_to_id[raw] = b['id']
         name_to_id[raw.strip()] = b['id']
-        # Also store without newline escapes
         clean = raw.replace('\\n', ' ').replace('\n', ' ').strip()
         name_to_id[clean] = b['id']
 
@@ -87,53 +85,70 @@ def parse_mdl(filepath):
         if name in name_to_id: return name_to_id[name]
         clean = name.replace('\\n', ' ').replace('\n', ' ').strip()
         if clean in name_to_id: return name_to_id[clean]
-        # Try partial match
         for k, v in name_to_id.items():
             if k.strip() == name.strip(): return v
         return None
 
-    # ---- Parse ALL Line connections ----
+    # ---- Parse ALL Line connections with port numbers ----
     for lm in re.finditer(r'\bLine\s*\{(.*?)\n\s*\}', content, re.DOTALL):
         lc = lm.group(1)
         src = _val(lc, 'SrcBlock')
         dst = _val(lc, 'DstBlock')
+
+        # Get port numbers
+        src_port = 1
+        dst_port = 1
+        sp_m = re.search(r'^\s*SrcPort\s+(\d+)', lc, re.MULTILINE)
+        dp_m = re.search(r'^\s*DstPort\s+(\d+)', lc, re.MULTILINE)
+        if sp_m: src_port = int(sp_m.group(1))
+        if dp_m: dst_port = int(dp_m.group(1))
+
         if src and dst:
             sid = resolve(src)
             did = resolve(dst)
             if sid and did and sid != did:
-                connections.append({'from': sid, 'to': did})
+                connections.append({
+                    'from': sid, 'to': did,
+                    'src_port': src_port, 'dst_port': dst_port
+                })
+
         # Branch connections
         for bm in re.finditer(r'Branch\s*\{(.*?)\}', lc, re.DOTALL):
-            dst2 = _val(bm.group(1), 'DstBlock')
+            bc2 = bm.group(1)
+            dst2 = _val(bc2, 'DstBlock')
+            dp2_m = re.search(r'^\s*DstPort\s+(\d+)', bc2, re.MULTILINE)
+            dst_port2 = int(dp2_m.group(1)) if dp2_m else 1
             if src and dst2:
                 sid = resolve(src)
                 did = resolve(dst2)
                 if sid and did and sid != did:
-                    connections.append({'from': sid, 'to': did})
+                    connections.append({
+                        'from': sid, 'to': did,
+                        'src_port': src_port, 'dst_port': dst_port2
+                    })
 
-    # Deduplicate
+    # Deduplicate by (from, to, dst_port)
     seen, unique = set(), []
     for c in connections:
-        k = (c['from'], c['to'])
+        k = (c['from'], c['to'], c.get('dst_port', 1))
         if k not in seen:
             seen.add(k)
             unique.append(c)
 
-    # Try to extract sim settings from MDL
+    # ---- Extract simulation settings ----
     sim_dt   = 0.1
     sim_stop = 10.0
     try:
-        import re as _re
-        m = _re.search(r'StopTime\s+"([^"]+)"', content)
+        m = re.search(r'StopTime\s+"([^"]+)"', content)
         if m:
             v = m.group(1).strip()
-            if v not in ('inf','Inf'):
+            if v not in ('inf', 'Inf'):
                 try: sim_stop = float(v)
                 except: pass
-        m = _re.search(r'FixedStep\s+"([^"]+)"', content)
+        m = re.search(r'FixedStep\s+"([^"]+)"', content)
         if m:
             v = m.group(1).strip()
-            if v not in ('auto','inf','Inf',''):
+            if v not in ('auto', 'inf', 'Inf', ''):
                 try: sim_dt = float(v)
                 except: pass
     except:
@@ -144,12 +159,18 @@ def parse_mdl(filepath):
 
 def _normalize(btype):
     return {
-        'S-Function': 'SFunction', 'S-function': 'SFunction',
-        'Math': 'MathFunction', 'Trigonometry': 'Trigonometry',
-        'Logic': 'LogicOperator',
+        'S-Function':  'SFunction',
+        'S-function':  'SFunction',
+        'Math':        'MathFunction',
+        'Trigonometry':'Trigonometry',
+        'Logic':       'LogicOperator',
+        'Saturate':    'Saturate',
     }.get(btype, btype)
 
 
 def _val(content, key):
-    m = re.search(rf'^\s*{re.escape(key)}\s+"?([^"\n]+)"?\s*$', content, re.MULTILINE)
+    m = re.search(
+        rf'^\s*{re.escape(key)}\s+"?([^"\n]+)"?\s*$',
+        content, re.MULTILINE
+    )
     return m.group(1).strip().strip('"') if m else None
