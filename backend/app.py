@@ -45,7 +45,10 @@ def convert():
         else:
             return jsonify({'error': f'Unsupported file type: .{ext}'}), 400
 
-        c_code = generate_c_code(blocks, connections)
+        from converter.c_code_generator import generate_simple_c_code
+        c_code = generate_simple_c_code(blocks, connections)
+        if c_code is None:
+           c_code = generate_c_code(blocks, connections)
 
         diagram_data = {
             'blocks': [
