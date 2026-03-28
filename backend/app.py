@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
+import traceback
 
 app = Flask(__name__)
 CORS(app, origins=["*"])
@@ -8,28 +9,24 @@ CORS(app, origins=["*"])
 UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-from parsers.slx_parser import parse_slx
-from parsers.mdl_parser import parse_mdl
-from parsers.pdf_parser import parse_pdf
-from parsers.image_parser import parse_image
-from converter.c_code_generator import generate_c_code
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'running', 'message': 'SimToC backend is live!'})
+
 
 @app.route('/convert', methods=['POST'])
 def convert():
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
 
-    file = request.files['file']
+    file     = request.files['file']
     filename = file.filename
 
     if not filename:
         return jsonify({'error': 'Empty filename'}), 400
 
-    ext = filename.rsplit('.', 1)[-1].lower()
+    ext      = filename.rsplit('.', 1)[-1].lower()
     filepath = os.path.join(UPLOAD_FOLDER, filename)
     file.save(filepath)
 
@@ -37,7 +34,9 @@ def convert():
         sim_dt   = 0.1
         sim_stop = 10.0
 
+        # ---- Parse file ----
         if ext == 'slx':
+            from parsers.slx_parser import parse_slx
             result = parse_slx(filepath)
             if len(result) == 4:
                 blocks, connections, sim_dt, sim_stop = result
@@ -45,6 +44,7 @@ def convert():
                 blocks, connections = result
 
         elif ext == 'mdl':
+            from parsers.mdl_parser import parse_mdl
             result = parse_mdl(filepath)
             if len(result) == 4:
                 blocks, connections, sim_dt, sim_stop = result
@@ -52,23 +52,35 @@ def convert():
                 blocks, connections = result
 
         elif ext == 'pdf':
-            blocks, connections = parse_pdf(filepath)
+            from parsers.pdf_parser import parse_pdf
+            result = parse_pdf(filepath)
+            if len(result) == 4:
+                blocks, connections, sim_dt, sim_stop = result
+            else:
+                blocks, connections = result
 
         elif ext in ['png', 'jpg', 'jpeg', 'bmp']:
-            blocks, connections = parse_image(filepath)
+            from parsers.image_parser import parse_image
+            result = parse_image(filepath)
+            if len(result) == 4:
+                blocks, connections, sim_dt, sim_stop = result
+            else:
+                blocks, connections = result
 
         else:
             return jsonify({'error': f'Unsupported file type: .{ext}'}), 400
 
-        # Generate C code — auto-detects combinational vs time-based
+        # ---- Generate C code ----
+        from converter.c_code_generator import generate_c_code
         c_code = generate_c_code(
-            blocks,
-            connections,
-            sim_dt=sim_dt,
-            sim_stop=sim_stop
+            blocks, connections,
+            sim_dt=sim_dt, sim_stop=sim_stop
         )
 
-        diagram_data = {
+        # ---- Build response ----
+        return jsonify({
+            'success':          True,
+            'c_code':           c_code,
             'blocks': [
                 {
                     'id':   str(b['id']),
@@ -85,25 +97,24 @@ def convert():
                     'to':   str(c.get('to',   ''))
                 }
                 for c in connections
-            ]
-        }
-
-        return jsonify({
-            'success':          True,
-            'c_code':           c_code,
-            'blocks':           diagram_data['blocks'],
-            'connections':      diagram_data['connections'],
+            ],
             'block_count':      len(blocks),
             'connection_count': len(connections)
         })
 
     except Exception as e:
-        import traceback
-        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+        return jsonify({
+            'error': str(e),
+            'trace': traceback.format_exc()
+        }), 500
 
     finally:
-        if os.path.exists(filepath):
-            os.remove(filepath)
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except:
+            pass
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))

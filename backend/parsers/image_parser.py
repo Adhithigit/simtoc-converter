@@ -1,13 +1,17 @@
-import cv2
-import numpy as np
-from PIL import Image
-import os
-import re
+# Image Parser for SimToC
+# Graceful imports — won't crash if OpenCV/Tesseract not installed
 
-# Try tesseract — graceful fallback if not available
+try:
+    import cv2
+    import numpy as np
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+
 try:
     import pytesseract
-    # Mac Homebrew path
+    from PIL import Image
+    import os
     if os.path.exists('/opt/homebrew/bin/tesseract'):
         pytesseract.pytesseract.tesseract_cmd = '/opt/homebrew/bin/tesseract'
     elif os.path.exists('/usr/local/bin/tesseract'):
@@ -16,61 +20,40 @@ try:
 except ImportError:
     TESSERACT = False
 
-# ================================================================
-# Block type classification — same keyword map as PDF parser
-# ================================================================
-BLOCK_KEYWORDS = {
-    'transfer fcn':   'TransferFcn',
-    'transfer':       'TransferFcn',
-    'integrator':     'Integrator',
-    'derivative':     'Derivative',
-    'pid':            'PIDController',
-    'unit delay':     'UnitDelay',
-    'zero-order':     'ZeroOrderHold',
-    'zero order':     'ZeroOrderHold',
-    'saturation':     'Saturation',
-    'saturate':       'Saturation',
-    'subsystem':      'SubSystem',
-    'constant':       'Constant',
-    'inport':         'Inport',
-    'outport':        'Outport',
-    'demux':          'Demux',
-    'scope':          'Scope',
-    'display':        'Display',
-    'switch':         'Switch',
-    'product':        'Product',
-    'lookup':         'LookupTable',
-    'delay':          'UnitDelay',
-    'sine wave':      'SineWave',
-    'sine':           'SineWave',
-    'step':           'Step',
-    'gain':           'Gain',
-    'sum':            'Sum',
-    'mux':            'Mux',
-    'from':           'From',
-    'goto':           'Goto',
-    '1/s':            'Integrator',
-    's':              'Integrator',
-    '+':              'Sum',
-    '-':              'Sum',
-    '*':              'Product',
-    '/':              'Product',
-    'k':              'Gain',
-}
+import re
 
-# Simulink brand colours used to identify block types from colour
-BLOCK_COLORS = {
-    # (lower_hue, upper_hue, block_type)
-    # Simulink uses orange for Subsystems, cyan for sources, etc.
+BLOCK_KEYWORDS = {
+    'transfer fcn':  'TransferFcn',   'transfer':    'TransferFcn',
+    'integrator':    'Integrator',    'derivative':  'Derivative',
+    'pid':           'PIDController', 'unit delay':  'UnitDelay',
+    'zero-order':    'ZeroOrderHold', 'zero order':  'ZeroOrderHold',
+    'saturation':    'Saturation',    'saturate':    'Saturation',
+    'subsystem':     'SubSystem',     'constant':    'Constant',
+    'inport':        'Inport',        'outport':     'Outport',
+    'demux':         'Demux',         'scope':       'Scope',
+    'display':       'Display',       'switch':      'Switch',
+    'product':       'Product',       'lookup':      'LookupTable',
+    'delay':         'UnitDelay',     'sine wave':   'SineWave',
+    'sine':          'SineWave',      'step':        'Step',
+    'gain':          'Gain',          'sum':         'Sum',
+    'mux':           'Mux',           '1/s':         'Integrator',
+    '+':             'Sum',           'k':           'Gain',
 }
 
 
 def parse_image(filepath):
+    if not CV2_AVAILABLE:
+        raise ValueError(
+            "OpenCV is not installed. "
+            "Add 'opencv-python-headless' to requirements.txt and redeploy."
+        )
+
+    from PIL import Image as PILImage
     img_orig = cv2.imread(filepath)
     if img_orig is None:
-        raise ValueError("Could not read image. Please use PNG or JPG format.")
+        raise ValueError("Could not read image. Please use PNG or JPG.")
 
-    # Resize if very large (speeds up processing, OCR still accurate)
+    # Resize if very large
     h, w = img_orig.shape[:2]
     scale = 1.0
     if w > 2000:
@@ -79,46 +62,40 @@ def parse_image(filepath):
 
     gray = cv2.cvtColor(img_orig, cv2.COLOR_BGR2GRAY)
 
-    # ---- Step 1: Detect rectangular blocks ----
-    rects = _detect_rectangles(gray, img_orig)
-
-    blocks = []
-    connections = []
     counter = [0]
-
     def nid():
         counter[0] += 1
         return str(counter[0])
 
+    # ---- Detect rectangles ----
+    rects = _detect_rectangles(gray, img_orig)
+
+    blocks = []
     if rects:
-        for (x, y, w, h, color_hint) in rects:
-            # OCR the text inside the rectangle
-            roi_gray = gray[y:y+h, x:x+w]
-            text = _ocr_roi(roi_gray, img_orig[y:y+h, x:x+w]) if TESSERACT else ''
+        for (rx, ry, rw, rh, color_hint) in rects:
+            text = ''
+            if TESSERACT:
+                roi_gray = gray[ry:ry+rh, rx:rx+rw]
+                text = _ocr_roi(roi_gray)
 
-            btype = _classify(text, color_hint)
-            bname = _clean_name(text) or f'{btype}_{nid()}'
-            if not bname.strip():
-                bname = f'{btype}_{counter[0]}'
-
+            btype  = _classify(text, color_hint)
+            bname  = _clean_name(text) or f'{btype}_{nid()}'
             params = _extract_params(text, btype)
+            bid    = nid()
 
-            bid = nid()
             blocks.append({
-                'id':     bid,
-                'type':   btype,
-                'name':   bname,
-                'x':      float(x) / scale,
-                'y':      float(y) / scale,
+                'id': bid, 'type': btype, 'name': bname,
+                'x': float(rx) / scale,
+                'y': float(ry) / scale,
                 'params': params
             })
 
-    # ---- Step 2: Fallback — full image OCR ----
+    # ---- Fallback: full image OCR ----
     if not blocks and TESSERACT:
         blocks = _full_ocr_fallback(img_orig, gray, nid)
 
+    # ---- Last resort: grid regions ----
     if not blocks:
-        # Last resort: create placeholder blocks from image regions
         blocks = _region_fallback(img_orig, nid)
 
     if not blocks:
@@ -130,20 +107,16 @@ def parse_image(filepath):
             "  • For best results upload the .slx or .mdl file directly"
         )
 
-    # ---- Step 3: Detect connections (arrows) ----
-    connections = _detect_arrows(img_orig, gray, blocks, scale)
+    # ---- Detect connections ----
+    connections = _detect_arrows(gray, blocks, scale)
 
-    # Fallback: chain left-to-right if no arrows detected
     if not connections and len(blocks) > 1:
-        sorted_b = sorted(blocks, key=lambda b: (b['x'], b['y']))
-        for i in range(len(sorted_b) - 1):
-            # Only connect if horizontally adjacent (same row roughly)
-            if abs(sorted_b[i]['y'] - sorted_b[i+1]['y']) < 80:
+        sb = sorted(blocks, key=lambda b: (b['x'], b['y']))
+        for i in range(len(sb) - 1):
+            if abs(sb[i]['y'] - sb[i+1]['y']) < 80:
                 connections.append({
-                    'from':     sorted_b[i]['id'],
-                    'to':       sorted_b[i+1]['id'],
-                    'src_port': 1,
-                    'dst_port': 1
+                    'from': sb[i]['id'], 'to': sb[i+1]['id'],
+                    'src_port': 1, 'dst_port': 1
                 })
 
     return blocks, connections, 0.1, 10.0
@@ -154,101 +127,69 @@ def parse_image(filepath):
 # ================================================================
 
 def _detect_rectangles(gray, img_bgr):
-    """Detect rectangular blocks in a Simulink diagram image."""
     results = []
-
-    # Preprocess: enhance edges
     blurred = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    # Try multiple edge thresholds to catch faint lines
     for low, high in [(30, 100), (50, 150), (80, 200)]:
         edged = cv2.Canny(blurred, low, high)
-        edged = cv2.dilate(edged, np.ones((2,2), np.uint8), iterations=1)
-
+        edged = cv2.dilate(edged, np.ones((2, 2), np.uint8), iterations=1)
         contours, _ = cv2.findContours(
             edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-
         for c in contours:
-            peri  = cv2.arcLength(c, True)
+            peri   = cv2.arcLength(c, True)
             approx = cv2.approxPolyDP(c, 0.03 * peri, True)
-
-            # Accept 4-sided shapes (rectangles/parallelograms)
             if len(approx) not in (4, 5, 6):
                 continue
-
             x, y, w, h = cv2.boundingRect(approx)
             aspect = w / max(h, 1)
-
-            # Filter: reasonable block size, not the whole image
             if (w < 20 or h < 15 or
-                w > gray.shape[1] * 0.85 or
-                h > gray.shape[0] * 0.85):
+                    w > gray.shape[1] * 0.85 or
+                    h > gray.shape[0] * 0.85 or
+                    aspect < 0.3 or aspect > 6.0):
                 continue
+            roi   = img_bgr[y:y+h, x:x+w]
+            color = _dominant_color(roi)
+            results.append((x, y, w, h, color))
 
-            # Aspect ratio: Simulink blocks are typically 0.4–4.0
-            if aspect < 0.3 or aspect > 6.0:
-                continue
-
-            # Detect dominant colour inside (for block type hint)
-            roi = img_bgr[y:y+h, x:x+w]
-            color_hint = _dominant_color(roi)
-
-            results.append((x, y, w, h, color_hint))
-
-    # Remove duplicates / overlapping rects
-    results = _deduplicate_rects(results)
-
-    return results
+    return _dedup_rects(results)
 
 
-def _deduplicate_rects(rects):
-    """Remove overlapping rectangles, keeping the most informative."""
-    if not rects:
-        return []
-
-    # Sort by area descending
+def _dedup_rects(rects):
     rects = sorted(rects, key=lambda r: r[2]*r[3], reverse=True)
-    kept = []
-
+    kept  = []
     for r in rects:
         x, y, w, h = r[0], r[1], r[2], r[3]
-        overlaps = False
+        overlap = False
         for k in kept:
             kx, ky, kw, kh = k[0], k[1], k[2], k[3]
-            # IoU overlap check
             ix1 = max(x, kx); iy1 = max(y, ky)
             ix2 = min(x+w, kx+kw); iy2 = min(y+h, ky+kh)
             if ix2 > ix1 and iy2 > iy1:
-                inter = (ix2-ix1) * (iy2-iy1)
+                inter = (ix2-ix1)*(iy2-iy1)
                 union = w*h + kw*kh - inter
                 if inter / max(union, 1) > 0.4:
-                    overlaps = True
+                    overlap = True
                     break
-        if not overlaps:
+        if not overlap:
             kept.append(r)
-
     return kept
 
 
 def _dominant_color(roi):
-    """Return dominant HSV hue bucket as a color hint string."""
-    if roi.size == 0:
+    if roi is None or roi.size == 0:
         return 'unknown'
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    hue = hsv[:, :, 0].mean()
-    if hue < 15 or hue > 165:
-        return 'red'
-    elif 15 <= hue < 30:
-        return 'orange'
-    elif 30 <= hue < 75:
-        return 'yellow_green'
-    elif 75 <= hue < 105:
-        return 'green'
-    elif 105 <= hue < 135:
-        return 'cyan'
-    elif 135 <= hue < 155:
-        return 'blue'
+    try:
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        hue = hsv[:, :, 0].mean()
+        if hue < 15 or hue > 165: return 'red'
+        if 15  <= hue < 30:       return 'orange'
+        if 30  <= hue < 75:       return 'yellow_green'
+        if 75  <= hue < 105:      return 'green'
+        if 105 <= hue < 135:      return 'cyan'
+        if 135 <= hue < 155:      return 'blue'
+    except:
+        pass
     return 'unknown'
 
 
@@ -256,47 +197,35 @@ def _dominant_color(roi):
 # OCR
 # ================================================================
 
-def _ocr_roi(gray_roi, color_roi):
-    """OCR a single block ROI with preprocessing."""
+def _ocr_roi(gray_roi):
     if not TESSERACT:
         return ''
     try:
-        # Enlarge small ROIs
         h, w = gray_roi.shape
         if w < 60 or h < 30:
             gray_roi = cv2.resize(
                 gray_roi, (max(w*3, 120), max(h*3, 60)),
                 interpolation=cv2.INTER_CUBIC
             )
-
-        # Binarise for better OCR
         _, binary = cv2.threshold(
-            gray_roi, 0, 255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            gray_roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
         )
-
-        # Try both normal and inverted (dark text on light, light on dark)
-        text1 = pytesseract.image_to_string(
-            binary,
-            config='--psm 8 --oem 3 -c tessedit_char_whitelist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_+*/- "'
+        cfg  = '--psm 8 --oem 3'
+        t1   = pytesseract.image_to_string(binary, config=cfg).strip()
+        t2   = pytesseract.image_to_string(
+            cv2.bitwise_not(binary), config=cfg
         ).strip()
-        text2 = pytesseract.image_to_string(
-            cv2.bitwise_not(binary),
-            config='--psm 8 --oem 3 -c tessedit_char_whitelist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_+*/- "'
-        ).strip()
-
-        # Return whichever is longer
-        return text1 if len(text1) >= len(text2) else text2
+        return t1 if len(t1) >= len(t2) else t2
     except:
         return ''
 
 
 def _full_ocr_fallback(img_bgr, gray, nid):
-    """OCR the whole image and extract block info from text."""
     if not TESSERACT:
         return []
     try:
-        pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+        from PIL import Image as PILImage
+        pil  = PILImage.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
         data = pytesseract.image_to_data(
             pil, output_type=pytesseract.Output.DICT
         )
@@ -304,210 +233,139 @@ def _full_ocr_fallback(img_bgr, gray, nid):
         return []
 
     blocks = []
-    used_words = set()
+    used   = set()
+    n      = len(data['text'])
 
-    n = len(data['text'])
     for i in range(n):
         word = data['text'][i].strip()
-        if not word or i in used_words:
+        if not word or i in used or int(data['conf'][i]) < 40:
             continue
-
-        conf = int(data['conf'][i])
-        if conf < 40:
-            continue
-
-        # Collect neighbouring words on the same line
         cluster = [word]
-        used_words.add(i)
-        x_ref  = data['left'][i]
-        y_ref  = data['top'][i]
+        used.add(i)
+        x_ref = data['left'][i]
+        y_ref = data['top'][i]
 
         for j in range(i+1, n):
-            if j in used_words:
-                continue
+            if j in used: continue
             wj = data['text'][j].strip()
-            if not wj:
-                continue
-            if (abs(data['top'][j] - y_ref) < 20 and
-                    abs(data['left'][j] - x_ref) < 200):
+            if not wj: continue
+            if abs(data['top'][j]-y_ref) < 20 and abs(data['left'][j]-x_ref) < 200:
                 cluster.append(wj)
-                used_words.add(j)
+                used.add(j)
 
-        text = ' '.join(cluster)
+        text  = ' '.join(cluster)
         btype = _classify(text, 'unknown')
-
         if btype != 'SubSystem' or 'subsystem' in text.lower():
-            name   = _clean_name(text) or f'{btype}_{nid()}'
-            params = _extract_params(text, btype)
-            bid    = nid()
+            name = _clean_name(text) or f'{btype}_{nid()}'
+            bid  = nid()
             blocks.append({
-                'id':     bid,
-                'type':   btype,
-                'name':   name,
-                'x':      float(data['left'][i]),
-                'y':      float(data['top'][i]),
-                'params': params
+                'id': bid, 'type': btype, 'name': name,
+                'x': float(data['left'][i]),
+                'y': float(data['top'][i]),
+                'params': _extract_params(text, btype)
             })
-
     return blocks
 
 
 def _region_fallback(img_bgr, nid):
-    """Divide image into grid and assign generic block names."""
-    h, w = img_bgr.shape[:2]
-    grid_cols = min(5, max(2, w // 150))
-    grid_rows = min(3, max(1, h // 120))
-    blocks    = []
-
-    generic_types = ['Inport', 'Gain', 'Sum', 'Integrator',
-                     'Saturation', 'Outport']
-
-    cell_w = w // grid_cols
-    cell_h = h // grid_rows
-
-    for row in range(grid_rows):
-        for col in range(grid_cols):
-            idx   = row * grid_cols + col
-            btype = generic_types[idx % len(generic_types)]
+    h, w   = img_bgr.shape[:2]
+    cols   = min(5, max(2, w // 150))
+    rows   = min(3, max(1, h // 120))
+    types  = ['Inport','Gain','Sum','Integrator','Saturation','Outport']
+    cw, ch = w // cols, h // rows
+    blocks = []
+    for r in range(rows):
+        for c in range(cols):
+            idx   = r * cols + c
+            btype = types[idx % len(types)]
             bid   = nid()
             blocks.append({
-                'id':     bid,
-                'type':   btype,
-                'name':   f'{btype}_{bid}',
-                'x':      float(col * cell_w + 20),
-                'y':      float(row * cell_h + 20),
-                'params': {}
+                'id': bid, 'type': btype, 'name': f'{btype}_{bid}',
+                'x': float(c*cw+20), 'y': float(r*ch+20), 'params': {}
             })
-
     return blocks
 
 
 # ================================================================
-# Arrow / Connection Detection
+# Arrow Detection
 # ================================================================
 
-def _detect_arrows(img_bgr, gray, blocks, scale=1.0):
-    """
-    Detect horizontal/vertical lines that connect blocks.
-    Returns list of connection dicts.
-    """
-    connections = []
-    if len(blocks) < 2:
-        return connections
+def _detect_arrows(gray, blocks, scale=1.0):
+    if not CV2_AVAILABLE or len(blocks) < 2:
+        return []
 
-    # Build a map of block centres
-    centres = {}
-    for b in blocks:
-        cx = (b['x'] + 60) * scale   # approx centre
-        cy = (b['y'] + 20) * scale
-        centres[b['id']] = (cx, cy)
+    centres = {
+        b['id']: (b['x'] * scale + 55, b['y'] * scale + 18)
+        for b in blocks
+    }
 
-    # Detect lines using HoughLinesP
     edges = cv2.Canny(gray, 50, 150)
     lines = cv2.HoughLinesP(
-        edges, 1, np.pi/180,
-        threshold=30,
-        minLineLength=30,
-        maxLineGap=15
+        edges, 1, 3.14159/180,
+        threshold=30, minLineLength=30, maxLineGap=15
     )
-
     if lines is None:
-        return connections
+        return []
 
-    seen = set()
+    conns = []
+    seen  = set()
+
     for line in lines:
         x1, y1, x2, y2 = line[0]
-
-        # Find nearest block to each endpoint
-        src_id = _nearest_block_id(x1, y1, centres, max_dist=80)
-        dst_id = _nearest_block_id(x2, y2, centres, max_dist=80)
-
-        if src_id and dst_id and src_id != dst_id:
-            # Arrow goes left-to-right or top-to-bottom
-            src_cx, src_cy = centres[src_id]
-            dst_cx, dst_cy = centres[dst_id]
-
-            # Ensure arrow direction (src is to the left/top of dst)
-            if src_cx > dst_cx:
-                src_id, dst_id = dst_id, src_id
-
-            k = (src_id, dst_id)
+        sid = _nearest(x1, y1, centres, 80)
+        did = _nearest(x2, y2, centres, 80)
+        if sid and did and sid != did:
+            scx = centres[sid][0]
+            dcx = centres[did][0]
+            if scx > dcx:
+                sid, did = did, sid
+            k = (sid, did)
             if k not in seen:
                 seen.add(k)
-                connections.append({
-                    'from':     src_id,
-                    'to':       dst_id,
-                    'src_port': 1,
-                    'dst_port': 1
+                conns.append({
+                    'from': sid, 'to': did,
+                    'src_port': 1, 'dst_port': 1
                 })
+    return conns
 
-    return connections
 
-
-def _nearest_block_id(px, py, centres, max_dist=60):
-    """Return the block id whose centre is nearest to (px, py)."""
-    best_id   = None
-    best_dist = max_dist
-
+def _nearest(px, py, centres, max_d):
+    best_id, best_d = None, max_d
     for bid, (cx, cy) in centres.items():
-        d = ((px - cx)**2 + (py - cy)**2) ** 0.5
-        if d < best_dist:
-            best_dist = d
-            best_id   = bid
-
+        d = ((px-cx)**2 + (py-cy)**2) ** 0.5
+        if d < best_d:
+            best_d, best_id = d, bid
     return best_id
 
 
 # ================================================================
-# Text Classification & Utilities
+# Classification & Utilities
 # ================================================================
 
 def _classify(text, color_hint='unknown'):
-    """Classify a block from its OCR text and colour hint."""
-    tl = text.lower().strip()
-
-    # Exact/longest match first
-    best_type  = None
-    best_len   = 0
+    tl   = text.lower().strip()
+    best, best_len = None, 0
     for kw, btype in BLOCK_KEYWORDS.items():
         if kw in tl and len(kw) > best_len:
-            best_type = btype
-            best_len  = len(kw)
-
-    if best_type:
-        return best_type
-
-    # Colour-based fallback (Simulink uses specific colours)
+            best, best_len = btype, len(kw)
+    if best:
+        return best
     color_map = {
-        'orange':       'SubSystem',
-        'cyan':         'Inport',
-        'yellow_green': 'Constant',
-        'green':        'Outport',
+        'orange': 'SubSystem', 'cyan': 'Inport',
+        'yellow_green': 'Constant', 'green': 'Outport',
     }
-    if color_hint in color_map:
-        return color_map[color_hint]
-
-    return 'SubSystem'
+    return color_map.get(color_hint, 'SubSystem')
 
 
 def _clean_name(text):
-    """Turn OCR text into a valid C identifier-style name."""
-    # Remove non-alphanumeric except spaces and underscores
     name = re.sub(r'[^\w\s]', '', text).strip()
-    # Collapse whitespace
     name = re.sub(r'\s+', '_', name)
-    # Limit length
     return name[:20] if name else ''
 
 
 def _extract_params(text, btype):
-    """Extract block parameters from OCR text."""
     params = {}
-    tl = text.lower()
-
-    # Generic: look for numbers
     nums = re.findall(r'[-\d.]+(?:e[-+]?\d+)?', text)
-
     if btype == 'Gain' and nums:
         params['Gain'] = nums[0]
     elif btype == 'Constant' and nums:
@@ -516,11 +374,4 @@ def _extract_params(text, btype):
         vals = sorted([float(n) for n in nums[:2]])
         params['LowerLimit'] = str(vals[0])
         params['UpperLimit'] = str(vals[1])
-    elif btype == 'Step' and nums:
-        params['Time']   = nums[0]
-        params['After']  = nums[1] if len(nums) > 1 else '1.0'
-    elif btype in ('TransferFcn',) and nums:
-        params['Numerator']   = f'[{nums[0]}]' if nums else '[1]'
-        params['Denominator'] = f'[{" ".join(nums[1:3])}]' if len(nums) > 1 else '[1 1]'
-
     return params
