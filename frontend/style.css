@@ -353,3 +353,11 @@ main {
   stroke-width: 1.5;
   marker-end: url(#arrow);
 }
+
+/* Warning state for backend waking up */
+.status-dot.warning {
+  background: #ffaa00;
+  box-shadow: 0 0 8px #ffaa00;
+  animation: blink 1s infinite;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }

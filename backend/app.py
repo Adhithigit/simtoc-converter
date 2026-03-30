@@ -4,19 +4,40 @@ import os
 import traceback
 
 app = Flask(__name__)
-CORS(app, origins=["*"])
+
+# Fix CORS — allow ALL origins explicitly
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization", "Accept"]
+    }
+})
 
 UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
-@app.route('/health', methods=['GET'])
+@app.after_request
+def add_cors_headers(response):
+    """Add CORS headers to every response — belt and suspenders approach."""
+    response.headers['Access-Control-Allow-Origin']  = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Accept'
+    return response
+
+
+@app.route('/health', methods=['GET', 'OPTIONS'])
 def health():
     return jsonify({'status': 'running', 'message': 'SimToC backend is live!'})
 
 
-@app.route('/convert', methods=['POST'])
+@app.route('/convert', methods=['POST', 'OPTIONS'])
 def convert():
+    # Handle preflight OPTIONS request
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
 
@@ -34,7 +55,6 @@ def convert():
         sim_dt   = 0.1
         sim_stop = 10.0
 
-        # ---- Parse file ----
         if ext == 'slx':
             from parsers.slx_parser import parse_slx
             result = parse_slx(filepath)
@@ -70,14 +90,12 @@ def convert():
         else:
             return jsonify({'error': f'Unsupported file type: .{ext}'}), 400
 
-        # ---- Generate C code ----
         from converter.c_code_generator import generate_c_code
         c_code = generate_c_code(
             blocks, connections,
             sim_dt=sim_dt, sim_stop=sim_stop
         )
 
-        # ---- Build response ----
         return jsonify({
             'success':          True,
             'c_code':           c_code,
