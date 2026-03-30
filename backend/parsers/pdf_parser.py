@@ -1,5 +1,10 @@
 # PDF Parser for SimToC
-# Graceful import — won't crash if PyMuPDF not installed
+# Uses Claude AI to extract Simulink blocks from PDF files
+
+import os
+import re
+import base64
+import json
 
 try:
     import fitz
@@ -7,63 +12,50 @@ try:
 except ImportError:
     FITZ_AVAILABLE = False
 
-import re
-
-BLOCK_KEYWORDS = {
-    'transferfcn':       ('TransferFcn',            10),
-    'transfer fcn':      ('TransferFcn',            10),
-    'transfer function': ('TransferFcn',            10),
-    'pidcontroller':     ('PIDController',          10),
-    'pid controller':    ('PIDController',          10),
-    'unitdelay':         ('UnitDelay',              10),
-    'unit delay':        ('UnitDelay',              10),
-    'zero-order hold':   ('ZeroOrderHold',          10),
-    'zero order hold':   ('ZeroOrderHold',          10),
-    'discretefilter':    ('DiscreteFilter',         10),
-    'sinewave':          ('SineWave',               10),
-    'sine wave':         ('SineWave',               10),
-    'pulsegenerator':    ('DiscretePulseGenerator', 10),
-    'pulse generator':   ('DiscretePulseGenerator', 10),
-    'state space':       ('StateSpace',             10),
-    'ratelimiter':       ('RateLimiter',            10),
-    'rate limiter':      ('RateLimiter',            10),
-    'subsystem':         ('SubSystem',               9),
-    'integrator':        ('Integrator',              9),
-    'derivative':        ('Derivative',              9),
-    'saturation':        ('Saturation',              9),
-    'saturate':          ('Saturation',              9),
-    'constant':          ('Constant',                9),
-    'inport':            ('Inport',                  9),
-    'outport':           ('Outport',                 9),
-    'demux':             ('Demux',                   9),
-    'scope':             ('Scope',                   9),
-    'display':           ('Display',                 9),
-    'switch':            ('Switch',                  9),
-    'product':           ('Product',                 8),
-    'lookup':            ('LookupTable',             8),
-    'delay':             ('UnitDelay',               8),
-    'gain':              ('Gain',                    8),
-    'sum':               ('Sum',                     8),
-    'mux':               ('Mux',                     8),
-    'step':              ('Step',                    8),
-    'pid':               ('PIDController',           7),
-    'sin':               ('SineWave',                7),
-}
-
-CONNECTION_PATTERNS = [
-    r'(\w[\w\s]*?)\s*[-\u2014\u2192>]+\s*(\w[\w\s]*)',
-    r'(\w[\w\s]*?)\s+connects?\s+to\s+(\w[\w\s]*)',
-    r'output\s+of\s+(\w[\w\s]*?)\s+(?:goes?\s+to|feeds?)\s+(\w[\w\s]*)',
-]
-
 
 def parse_pdf(filepath):
+    """
+    Parse a PDF containing a Simulink diagram or block list.
+    Uses Claude AI for accurate extraction.
+    Returns (blocks, connections, sim_dt, sim_stop)
+    """
     if not FITZ_AVAILABLE:
         raise ValueError(
-            "PyMuPDF (fitz) is not installed. "
-            "Add 'pymupdf' to requirements.txt and redeploy."
+            "PyMuPDF not installed. Add 'pymupdf' to requirements.txt."
         )
 
+    doc  = fitz.open(filepath)
+    text = ""
+    pages_b64 = []
+
+    for page in doc:
+        text += page.get_text() + "\n"
+        # Render page as image for visual analysis
+        mat  = fitz.Matrix(2.0, 2.0)  # 2x zoom for clarity
+        pix  = page.get_pixmap(matrix=mat)
+        png  = pix.tobytes("png")
+        pages_b64.append(base64.b64encode(png).decode('utf-8'))
+
+    doc.close()
+
+    # Try text-based extraction first (fast)
+    blocks, connections = _extract_from_text(text)
+
+    # If text extraction failed or got too few blocks, use AI vision
+    if len(blocks) < 2 and pages_b64:
+        blocks, connections = _call_claude_pdf(pages_b64[0], text)
+
+    if not blocks:
+        raise ValueError(
+            "No Simulink blocks found in this PDF.\n"
+            "For best results, upload the .slx or .mdl file directly."
+        )
+
+    return blocks, connections, 0.1, 10.0
+
+
+def _extract_from_text(text):
+    """Try to extract blocks from PDF text (works for text-based PDFs)."""
     blocks = []
     connections = []
     counter = [0]
@@ -72,193 +64,128 @@ def parse_pdf(filepath):
         counter[0] += 1
         return str(counter[0])
 
-    doc = fitz.open(filepath)
-    full_text = ""
-    word_positions = []  # (x, y, word)
+    # Look for lines that look like "BlockName [BlockType] value=X"
+    BTYPES = {
+        'Constant':'Constant','Gain':'Gain','Sum':'Sum','Integrator':'Integrator',
+        'Derivative':'Derivative','Saturation':'Saturation','Saturate':'Saturation',
+        'TransferFcn':'TransferFcn','Transfer Fcn':'TransferFcn',
+        'PIDController':'PIDController','PID Controller':'PIDController',
+        'UnitDelay':'UnitDelay','Unit Delay':'UnitDelay',
+        'ZeroOrderHold':'ZeroOrderHold','Scope':'Scope','Display':'Display',
+        'Inport':'Inport','Outport':'Outport','Mux':'Mux','Demux':'Demux',
+        'Product':'Product','Switch':'Switch','Step':'Step','SineWave':'SineWave',
+        'Sine Wave':'SineWave','SubSystem':'SubSystem','Reference':'Reference',
+    }
 
-    for page in doc:
-        full_text += page.get_text() + "\n"
-        for block in page.get_text("dict")["blocks"]:
-            if block.get("type") == 0:
-                for line in block.get("lines", []):
-                    for span in line.get("spans", []):
-                        for word in span["text"].split():
-                            if word.strip():
-                                bbox = span["bbox"]
-                                word_positions.append((
-                                    bbox[0], bbox[1], word.strip()
-                                ))
-    doc.close()
+    seen = set()
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line: continue
+        for btype_raw, btype in BTYPES.items():
+            if btype_raw.lower() in line.lower():
+                # Extract name
+                name = re.sub(r'(?i)' + re.escape(btype_raw), '', line).strip()
+                name = re.sub(r'[^a-zA-Z0-9_\s]', '', name).strip()[:20]
+                name = name or f'{btype}_{nid()}'
+                if name not in seen:
+                    seen.add(name)
+                    params = {}
+                    nums = re.findall(r'[-\d.]+', line)
+                    if nums:
+                        if btype == 'Gain': params['Gain'] = nums[0]
+                        elif btype == 'Constant': params['Value'] = nums[0]
+                    bid = nid()
+                    blocks.append({
+                        'id': bid, 'type': btype, 'name': name,
+                        'x': float((len(blocks) % 5) * 160 + 50),
+                        'y': float((len(blocks) // 5) * 80  + 50),
+                        'params': params
+                    })
+                break
 
-    # Strategy 1 — structured block listings
-    structured = _extract_structured(full_text)
-    if structured:
-        sx, sy = 160, 80
-        for i, (btype, bname, params) in enumerate(structured):
-            bid = nid()
-            blocks.append({
-                'id': bid, 'type': btype, 'name': bname,
-                'x': float(50 + (i % 5) * sx),
-                'y': float(50 + (i // 5) * sy),
-                'params': params
-            })
-
-    # Strategy 2 — keyword scan
-    if not blocks:
-        blocks = _keyword_scan(full_text, nid)
-
-    # Strategy 3 — spatial word clusters
-    if not blocks and word_positions:
-        blocks = _spatial_cluster(word_positions, nid)
-
-    if not blocks:
-        raise ValueError(
-            "No Simulink blocks found in PDF.\n"
-            "For best results use a PDF exported from MATLAB, "
-            "or upload the .slx / .mdl file directly."
-        )
-
-    # Connections
-    name_to_id = {}
-    for b in blocks:
-        name_to_id[b['name'].lower()] = b['id']
-        name_to_id[b['type'].lower()] = b['id']
-
-    connections = _extract_connections(full_text, name_to_id, blocks)
-
-    if not connections and len(blocks) > 1:
-        sb = sorted(blocks, key=lambda b: (b['x'], b['y']))
-        for i in range(len(sb) - 1):
+    # Chain connections if no arrows found
+    if blocks and len(blocks) > 1:
+        for i in range(len(blocks) - 1):
             connections.append({
-                'from': sb[i]['id'], 'to': sb[i+1]['id'],
+                'from': blocks[i]['id'], 'to': blocks[i+1]['id'],
                 'src_port': 1, 'dst_port': 1
             })
 
-    return blocks, connections, 0.1, 10.0
+    return blocks, connections
 
 
-def _extract_structured(text):
-    found = []
-    for line in text.split('\n'):
-        line = line.strip()
-        if not line or len(line) > 200:
-            continue
-        # Pattern: Name (BlockType) or [BlockType] Name
-        m = re.match(
-            r'^["\']?(\w[\w\s]*?)["\']?\s*[\(\[]\s*([A-Za-z][\w\s]*?)\s*[\)\]]'
-            r'(?:\s+(.*))?$', line
-        )
-        if m:
-            name  = m.group(1).strip()
-            btype = _classify(m.group(2).strip())
-            params = _parse_params(m.group(3) or '')
-            found.append((btype, name, params))
-    return found
+def _call_claude_pdf(page_b64, text_content):
+    """Use Claude vision on the first page of the PDF."""
+    import urllib.request
 
+    prompt = f"""You are analyzing a PDF page that contains a Simulink block diagram.
 
-def _keyword_scan(text, nid):
-    blocks = []
-    tl     = text.lower()
-    seen   = set()
+The PDF text content is:
+{text_content[:2000]}
 
-    for kw, (btype, _) in sorted(BLOCK_KEYWORDS.items(), key=lambda x: -x[1][1]):
-        start = 0
-        while True:
-            idx = tl.find(kw, start)
-            if idx == -1:
-                break
-            start = idx + 1
+Also look at the rendered page image carefully.
 
-            ctx   = text[max(0, idx-50): idx+len(kw)+50]
-            name  = _extract_nearby_name(ctx, kw, btype)
-            if name not in seen:
-                seen.add(name)
-                val_m  = re.search(r'(?:value|gain|k)\s*[=:]\s*([-\d.]+)', ctx, re.I)
-                params = {}
-                if val_m:
-                    params['Value'] = val_m.group(1)
-                    if btype == 'Gain':
-                        params['Gain'] = val_m.group(1)
+Extract ALL Simulink blocks and connections.
 
-                bid = nid()
-                blocks.append({
-                    'id': bid, 'type': btype, 'name': name,
-                    'x': 0.0, 'y': 0.0, 'params': params
-                })
+Return ONLY a JSON object:
+{{
+  "blocks": [
+    {{
+      "id": "1",
+      "type": "BlockType",
+      "name": "BlockName",
+      "x": 100,
+      "y": 100,
+      "params": {{"Value": "10"}}
+    }}
+  ],
+  "connections": [
+    {{"from": "1", "to": "2", "src_port": 1, "dst_port": 1}}
+  ]
+}}
 
-    sx, sy = 160, 80
-    for i, b in enumerate(blocks):
-        b['x'] = float(50 + (i % 5) * sx)
-        b['y'] = float(50 + (i // 5) * sy)
+Use exact Simulink types: Constant, Gain, Sum, Integrator, Saturation, TransferFcn, PIDController, Scope, Display, Inport, Outport, Mux, Demux, Product, Switch, Step, SineWave, UnitDelay, SubSystem, Reference.
+For each connection include src_port and dst_port numbers.
+Return ONLY the JSON."""
 
-    return blocks
+    payload = json.dumps({
+        "model": "claude-opus-4-5",
+        "max_tokens": 4096,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": page_b64
+                    }
+                },
+                {"type": "text", "text": prompt}
+            ]
+        }]
+    }).encode('utf-8')
 
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload,
+        headers={
+            "Content-Type":      "application/json",
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST"
+    )
 
-def _spatial_cluster(word_positions, nid):
-    blocks = []
-    used   = set()
-    wp     = sorted(word_positions, key=lambda w: (w[1], w[0]))
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='ignore')
+        raise ValueError(f"Claude API error {e.code}: {body[:200]}")
 
-    for i, (x, y, word) in enumerate(wp):
-        if i in used:
-            continue
-        cluster = [word]
-        used.add(i)
-        for j, (xj, yj, wj) in enumerate(wp):
-            if j not in used and abs(xj-x) < 80 and abs(yj-y) < 25:
-                cluster.append(wj)
-                used.add(j)
+    content = result.get('content', [])
+    text_out = ''.join(c.get('text','') for c in content if c.get('type')=='text')
 
-        text  = ' '.join(cluster)
-        btype = _classify(text)
-        if btype != 'SubSystem' or 'subsystem' in text.lower():
-            bid = nid()
-            blocks.append({
-                'id': bid, 'type': btype,
-                'name': text[:20].strip() or f'{btype}_{bid}',
-                'x': float(x), 'y': float(y), 'params': {}
-            })
-    return blocks
-
-
-def _extract_connections(text, name_to_id, blocks):
-    conns = []
-    seen  = set()
-    for pat in CONNECTION_PATTERNS:
-        for m in re.finditer(pat, text, re.I):
-            sn = m.group(1).strip().lower()
-            dn = m.group(2).strip().lower()
-            sid = name_to_id.get(sn) or next(
-                (b['id'] for b in blocks if sn in b['name'].lower()), None)
-            did = name_to_id.get(dn) or next(
-                (b['id'] for b in blocks if dn in b['name'].lower()), None)
-            if sid and did and sid != did:
-                k = (sid, did)
-                if k not in seen:
-                    seen.add(k)
-                    conns.append({'from': sid, 'to': did,
-                                  'src_port': 1, 'dst_port': 1})
-    return conns
-
-
-def _classify(text):
-    tl = text.lower()
-    best, score = 'SubSystem', 0
-    for kw, (btype, s) in BLOCK_KEYWORDS.items():
-        if kw in tl and s > score:
-            best, score = btype, s
-    return best
-
-
-def _extract_nearby_name(ctx, kw, btype):
-    m = re.search(r'\b([A-Z][a-zA-Z0-9_]{1,20})\b', ctx)
-    if m and m.group(1).lower() != kw:
-        return m.group(1)
-    return f'{btype}1'
-
-
-def _parse_params(raw):
-    params = {}
-    for m in re.finditer(r'(\w+)\s*[=:]\s*([-\d.eE+]+|\w+)', raw):
-        params[m.group(1)] = m.group(2)
-    return params
+    from parsers.image_parser import _parse_claude_response
+    return _parse_claude_response(text_out)

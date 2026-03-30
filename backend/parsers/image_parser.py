@@ -1,377 +1,274 @@
-# Image Parser for SimToC
-# Graceful imports — won't crash if OpenCV/Tesseract not installed
+# Image Parser for SimToC — No API key required
+# Handles both Simulink screenshots and SimToC website screenshots
+
+import os, re
 
 try:
-    import cv2
-    import numpy as np
+    import cv2, numpy as np
     CV2_AVAILABLE = True
 except ImportError:
     CV2_AVAILABLE = False
 
 try:
     import pytesseract
-    from PIL import Image
-    import os
-    if os.path.exists('/opt/homebrew/bin/tesseract'):
-        pytesseract.pytesseract.tesseract_cmd = '/opt/homebrew/bin/tesseract'
-    elif os.path.exists('/usr/local/bin/tesseract'):
-        pytesseract.pytesseract.tesseract_cmd = '/usr/local/bin/tesseract'
+    for _p in ['/opt/homebrew/bin/tesseract','/usr/bin/tesseract','/usr/local/bin/tesseract']:
+        if os.path.exists(_p):
+            pytesseract.pytesseract.tesseract_cmd = _p
+            break
     TESSERACT = True
 except ImportError:
     TESSERACT = False
 
-import re
-
-BLOCK_KEYWORDS = {
-    'transfer fcn':  'TransferFcn',   'transfer':    'TransferFcn',
-    'integrator':    'Integrator',    'derivative':  'Derivative',
-    'pid':           'PIDController', 'unit delay':  'UnitDelay',
-    'zero-order':    'ZeroOrderHold', 'zero order':  'ZeroOrderHold',
-    'saturation':    'Saturation',    'saturate':    'Saturation',
-    'subsystem':     'SubSystem',     'constant':    'Constant',
-    'inport':        'Inport',        'outport':     'Outport',
-    'demux':         'Demux',         'scope':       'Scope',
-    'display':       'Display',       'switch':      'Switch',
-    'product':       'Product',       'lookup':      'LookupTable',
-    'delay':         'UnitDelay',     'sine wave':   'SineWave',
-    'sine':          'SineWave',      'step':        'Step',
-    'gain':          'Gain',          'sum':         'Sum',
-    'mux':           'Mux',           '1/s':         'Integrator',
-    '+':             'Sum',           'k':           'Gain',
+# ── Type keywords ─────────────────────────────────────────────────
+TYPE_KW = {
+    'constant':'Constant','gain':'Gain',
+    'subtract':'Sum','sum':'Sum',
+    'multiply':'Product','divide':'Product','product':'Product',
+    'integrator':'Integrator','derivative':'Derivative',
+    'saturation':'Saturation','saturate':'Saturation',
+    'sat_sum':'Saturation','sat_sub':'Saturation',
+    'sat_mult':'Saturation','sat_div':'Saturation',
+    'transfer fcn':'TransferFcn','transfer':'TransferFcn',
+    'pid':'PIDController','unit delay':'UnitDelay','delay':'UnitDelay',
+    'zero order':'ZeroOrderHold','zero-order':'ZeroOrderHold',
+    'display':'Display','result':'Display','scope':'Scope',
+    'inport':'Inport','outport':'Outport',
+    'in1':'Inport','out1':'Outport',
+    'mux':'Mux','demux':'Demux','switch':'Switch',
+    'step':'Step','sine wave':'SineWave','sine':'SineWave',
+    'subsystem':'SubSystem','counter':'Reference',
 }
+
+# ── Color bands: (HSV_low, HSV_high, default_type, min_V) ─────────
+# SimToC website uses specific colours per block type
+COLORS = [
+    ([20,100, 60], [42,200,160], 'Constant'),   # dark yellow
+    ([40,100, 60], [85,255,200], 'Sum'),         # green
+    ([95, 60, 40], [135,220,190],'Product'),     # blue/teal
+    ([130,50, 60], [165,255,220],'Outport'),     # purple
+    ([0, 120, 80], [12,255,200], 'SFunction'),   # red
+    ([0,   0,180], [180, 35,240],'Display'),     # light gray
+]
 
 
 def parse_image(filepath):
     if not CV2_AVAILABLE:
-        raise ValueError(
-            "OpenCV is not installed. "
-            "Add 'opencv-python-headless' to requirements.txt and redeploy."
-        )
+        raise ValueError("OpenCV not installed. Add 'opencv-python-headless' to requirements.txt.")
 
-    from PIL import Image as PILImage
-    img_orig = cv2.imread(filepath)
-    if img_orig is None:
-        raise ValueError("Could not read image. Please use PNG or JPG.")
+    img = cv2.imread(filepath)
+    if img is None:
+        raise ValueError("Could not read image. Use PNG or JPG.")
 
-    # Resize if very large
-    h, w = img_orig.shape[:2]
+    h, w = img.shape[:2]
     scale = 1.0
-    if w > 2000:
-        scale = 2000.0 / w
-        img_orig = cv2.resize(img_orig, (2000, int(h * scale)))
+    if w > 2500:
+        scale = 2500.0 / w
+        img = cv2.resize(img, (2500, int(h*scale)))
 
-    gray = cv2.cvtColor(img_orig, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    hsv  = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
     counter = [0]
     def nid():
         counter[0] += 1
         return str(counter[0])
 
-    # ---- Detect rectangles ----
-    rects = _detect_rectangles(gray, img_orig)
+    # Detect image background
+    bg = float(img[:30, :30].mean())
+    is_dark = bg < 100
 
-    blocks = []
-    if rects:
-        for (rx, ry, rw, rh, color_hint) in rects:
-            text = ''
-            if TESSERACT:
-                roi_gray = gray[ry:ry+rh, rx:rx+rw]
-                text = _ocr_roi(roi_gray)
-
-            btype  = _classify(text, color_hint)
-            bname  = _clean_name(text) or f'{btype}_{nid()}'
-            params = _extract_params(text, btype)
-            bid    = nid()
-
-            blocks.append({
-                'id': bid, 'type': btype, 'name': bname,
-                'x': float(rx) / scale,
-                'y': float(ry) / scale,
-                'params': params
-            })
-
-    # ---- Fallback: full image OCR ----
-    if not blocks and TESSERACT:
-        blocks = _full_ocr_fallback(img_orig, gray, nid)
-
-    # ---- Last resort: grid regions ----
-    if not blocks:
-        blocks = _region_fallback(img_orig, nid)
+    blocks = _find_blocks(img, gray, hsv, nid, scale, is_dark)
 
     if not blocks:
         raise ValueError(
             "No blocks detected in image.\n"
-            "Tips:\n"
-            "  • Use a high-resolution screenshot (>1000px wide)\n"
-            "  • Make sure blocks are clearly visible rectangles\n"
-            "  • For best results upload the .slx or .mdl file directly"
+            "Tip: For perfect results upload the .slx file directly.\n"
+            "Screenshots must be clear and high resolution."
         )
 
-    # ---- Detect connections ----
-    connections = _detect_arrows(gray, blocks, scale)
-
-    if not connections and len(blocks) > 1:
-        sb = sorted(blocks, key=lambda b: (b['x'], b['y']))
-        for i in range(len(sb) - 1):
-            if abs(sb[i]['y'] - sb[i+1]['y']) < 80:
-                connections.append({
-                    'from': sb[i]['id'], 'to': sb[i+1]['id'],
-                    'src_port': 1, 'dst_port': 1
-                })
-
+    connections = _find_connections(gray, blocks, scale)
     return blocks, connections, 0.1, 10.0
 
 
-# ================================================================
-# Rectangle Detection
-# ================================================================
+def _find_blocks(img, gray, hsv, nid, scale, is_dark):
+    all_blocks = []
 
-def _detect_rectangles(gray, img_bgr):
-    results = []
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    if is_dark:
+        # SimToC website — use colour segmentation
+        for lower, upper, default_type in COLORS:
+            mask = cv2.inRange(hsv, np.array(lower, np.uint8), np.array(upper, np.uint8))
+            k    = np.ones((3,3), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k)
+            contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    for low, high in [(30, 100), (50, 150), (80, 200)]:
-        edged = cv2.Canny(blurred, low, high)
-        edged = cv2.dilate(edged, np.ones((2, 2), np.uint8), iterations=1)
-        contours, _ = cv2.findContours(
-            edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        for c in contours:
-            peri   = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.03 * peri, True)
-            if len(approx) not in (4, 5, 6):
-                continue
-            x, y, w, h = cv2.boundingRect(approx)
-            aspect = w / max(h, 1)
-            if (w < 20 or h < 15 or
-                    w > gray.shape[1] * 0.85 or
-                    h > gray.shape[0] * 0.85 or
-                    aspect < 0.3 or aspect > 6.0):
-                continue
-            roi   = img_bgr[y:y+h, x:x+w]
-            color = _dominant_color(roi)
-            results.append((x, y, w, h, color))
+            for c in contours:
+                x,y,bw,bh = cv2.boundingRect(c)
+                if bw < 30 or bh < 12 or bw/max(bh,1) > 12:
+                    continue
+                text  = _ocr(gray, x, y, bw, bh)
+                btype, bname = _parse_text(text, default_type)
+                params = _get_params(text, btype)
+                bid = nid()
+                all_blocks.append({
+                    'id':bid,'type':btype,'name':bname,
+                    'x':float(x)/scale,'y':float(y)/scale,'params':params,
+                    '_px':x+bw//2,'_py':y+bh//2
+                })
+    else:
+        # Actual Simulink screenshot — white/light background
+        blurred = cv2.GaussianBlur(gray,(3,3),0)
+        for thr_lo, thr_hi in [(30,100),(50,150)]:
+            edged = cv2.Canny(blurred, thr_lo, thr_hi)
+            edged = cv2.dilate(edged, np.ones((2,2),np.uint8))
+            contours,_ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in contours:
+                peri   = cv2.arcLength(c,True)
+                approx = cv2.approxPolyDP(c, 0.04*peri, True)
+                if len(approx) not in (4,5,6): continue
+                x,y,bw,bh = cv2.boundingRect(approx)
+                ar = bw/max(bh,1)
+                if bw < 25 or bh < 15 or bw > gray.shape[1]*.75 or ar < 0.25 or ar > 8:
+                    continue
+                text  = _ocr(gray, x, y, bw, bh)
+                # Colour hint from block fill
+                roi_h = hsv[y:y+bh, x:x+bw]
+                hint  = 'SubSystem'
+                if roi_h.size > 0:
+                    hue = roi_h[:,:,0].mean()
+                    sat = roi_h[:,:,1].mean()
+                    if sat > 40:
+                        hint = ('Constant' if 20<=hue<35 else
+                                'Sum'      if 40<=hue<80 else
+                                'Product'  if 100<=hue<130 else 'SubSystem')
+                btype, bname = _parse_text(text, hint)
+                bid = nid()
+                all_blocks.append({
+                    'id':bid,'type':btype,'name':bname,
+                    'x':float(x)/scale,'y':float(y)/scale,
+                    'params':_get_params(text,btype),
+                    '_px':x+bw//2,'_py':y+bh//2
+                })
 
-    return _dedup_rects(results)
-
-
-def _dedup_rects(rects):
-    rects = sorted(rects, key=lambda r: r[2]*r[3], reverse=True)
-    kept  = []
-    for r in rects:
-        x, y, w, h = r[0], r[1], r[2], r[3]
-        overlap = False
-        for k in kept:
-            kx, ky, kw, kh = k[0], k[1], k[2], k[3]
-            ix1 = max(x, kx); iy1 = max(y, ky)
-            ix2 = min(x+w, kx+kw); iy2 = min(y+h, ky+kh)
-            if ix2 > ix1 and iy2 > iy1:
-                inter = (ix2-ix1)*(iy2-iy1)
-                union = w*h + kw*kh - inter
-                if inter / max(union, 1) > 0.4:
-                    overlap = True
-                    break
-        if not overlap:
-            kept.append(r)
-    return kept
-
-
-def _dominant_color(roi):
-    if roi is None or roi.size == 0:
-        return 'unknown'
-    try:
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        hue = hsv[:, :, 0].mean()
-        if hue < 15 or hue > 165: return 'red'
-        if 15  <= hue < 30:       return 'orange'
-        if 30  <= hue < 75:       return 'yellow_green'
-        if 75  <= hue < 105:      return 'green'
-        if 105 <= hue < 135:      return 'cyan'
-        if 135 <= hue < 155:      return 'blue'
-    except:
-        pass
-    return 'unknown'
+    return _dedup(all_blocks)
 
 
-# ================================================================
-# OCR
-# ================================================================
+def _parse_text(raw, default_type):
+    """Extract block type and name from OCR text."""
+    lines = [l.strip() for l in (raw or '').split('\n') if l.strip()]
+    if not lines:
+        return default_type, default_type
 
-def _ocr_roi(gray_roi):
-    if not TESSERACT:
-        return ''
-    try:
-        h, w = gray_roi.shape
-        if w < 60 or h < 30:
-            gray_roi = cv2.resize(
-                gray_roi, (max(w*3, 120), max(h*3, 60)),
-                interpolation=cv2.INTER_CUBIC
-            )
-        _, binary = cv2.threshold(
-            gray_roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
-        cfg  = '--psm 8 --oem 3'
-        t1   = pytesseract.image_to_string(binary, config=cfg).strip()
-        t2   = pytesseract.image_to_string(
-            cv2.bitwise_not(binary), config=cfg
-        ).strip()
-        return t1 if len(t1) >= len(t2) else t2
-    except:
-        return ''
-
-
-def _full_ocr_fallback(img_bgr, gray, nid):
-    if not TESSERACT:
-        return []
-    try:
-        from PIL import Image as PILImage
-        pil  = PILImage.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-        data = pytesseract.image_to_data(
-            pil, output_type=pytesseract.Output.DICT
-        )
-    except:
-        return []
-
-    blocks = []
-    used   = set()
-    n      = len(data['text'])
-
-    for i in range(n):
-        word = data['text'][i].strip()
-        if not word or i in used or int(data['conf'][i]) < 40:
-            continue
-        cluster = [word]
-        used.add(i)
-        x_ref = data['left'][i]
-        y_ref = data['top'][i]
-
-        for j in range(i+1, n):
-            if j in used: continue
-            wj = data['text'][j].strip()
-            if not wj: continue
-            if abs(data['top'][j]-y_ref) < 20 and abs(data['left'][j]-x_ref) < 200:
-                cluster.append(wj)
-                used.add(j)
-
-        text  = ' '.join(cluster)
-        btype = _classify(text, 'unknown')
-        if btype != 'SubSystem' or 'subsystem' in text.lower():
-            name = _clean_name(text) or f'{btype}_{nid()}'
-            bid  = nid()
-            blocks.append({
-                'id': bid, 'type': btype, 'name': name,
-                'x': float(data['left'][i]),
-                'y': float(data['top'][i]),
-                'params': _extract_params(text, btype)
-            })
-    return blocks
-
-
-def _region_fallback(img_bgr, nid):
-    h, w   = img_bgr.shape[:2]
-    cols   = min(5, max(2, w // 150))
-    rows   = min(3, max(1, h // 120))
-    types  = ['Inport','Gain','Sum','Integrator','Saturation','Outport']
-    cw, ch = w // cols, h // rows
-    blocks = []
-    for r in range(rows):
-        for c in range(cols):
-            idx   = r * cols + c
-            btype = types[idx % len(types)]
-            bid   = nid()
-            blocks.append({
-                'id': bid, 'type': btype, 'name': f'{btype}_{bid}',
-                'x': float(c*cw+20), 'y': float(r*ch+20), 'params': {}
-            })
-    return blocks
-
-
-# ================================================================
-# Arrow Detection
-# ================================================================
-
-def _detect_arrows(gray, blocks, scale=1.0):
-    if not CV2_AVAILABLE or len(blocks) < 2:
-        return []
-
-    centres = {
-        b['id']: (b['x'] * scale + 55, b['y'] * scale + 18)
-        for b in blocks
-    }
-
-    edges = cv2.Canny(gray, 50, 150)
-    lines = cv2.HoughLinesP(
-        edges, 1, 3.14159/180,
-        threshold=30, minLineLength=30, maxLineGap=15
-    )
-    if lines is None:
-        return []
-
-    conns = []
-    seen  = set()
-
+    # Find block type from any line
+    btype = default_type
     for line in lines:
-        x1, y1, x2, y2 = line[0]
-        sid = _nearest(x1, y1, centres, 80)
-        did = _nearest(x2, y2, centres, 80)
-        if sid and did and sid != did:
-            scx = centres[sid][0]
-            dcx = centres[did][0]
-            if scx > dcx:
-                sid, did = did, sid
-            k = (sid, did)
+        tl = line.lower()
+        # Longest keyword match
+        best, bl = None, 0
+        for kw, bt in TYPE_KW.items():
+            if kw in tl and len(kw) > bl:
+                best, bl = bt, len(kw)
+        if best:
+            btype = best
+            break
+
+    # Name = line that isn't a block type keyword, or just the last line
+    name_lines = []
+    for line in lines:
+        tl = line.lower()
+        is_kw = any(kw in tl for kw in TYPE_KW)
+        if not is_kw or len(line.strip()) <= 3:
+            cleaned = re.sub(r'[^\w\s]','',line).strip()
+            if cleaned:
+                name_lines.append(cleaned)
+
+    bname = name_lines[0][:20] if name_lines else (lines[-1][:20] if lines else btype)
+    return btype, bname or btype
+
+
+def _get_params(text, btype):
+    nums = re.findall(r'[-\d.]+', text or '')
+    p = {}
+    if btype == 'Gain' and nums:        p['Gain']  = nums[0]
+    elif btype == 'Constant' and nums:  p['Value'] = nums[0]
+    elif btype == 'Saturation' and len(nums) >= 2:
+        v = sorted([float(n) for n in nums[:2]])
+        p['LowerLimit'] = str(v[0]); p['UpperLimit'] = str(v[1])
+    elif btype == 'Reference':
+        p['SourceBlock'] = 'simulink/Sources/Counter Free-Running'
+        p['SourceType']  = 'Counter Free-Running'
+    return p
+
+
+def _ocr(gray, x, y, w, h):
+    if not TESSERACT: return ''
+    try:
+        roi = gray[y:y+h, x:x+w]
+        sc  = max(3, 80//max(w,1))
+        big = cv2.resize(roi,(w*sc,h*sc),interpolation=cv2.INTER_CUBIC)
+        _,b1 = cv2.threshold(big,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        b2   = cv2.bitwise_not(b1)
+        cfg  = '--psm 6 --oem 3'
+        t1   = pytesseract.image_to_string(b1, config=cfg).strip()
+        t2   = pytesseract.image_to_string(b2, config=cfg).strip()
+        return t1 if len(t1) >= len(t2) else t2
+    except: return ''
+
+
+def _find_connections(gray, blocks, scale):
+    if len(blocks) < 2:
+        return []
+    centres = {b['id']:(b.get('_px', b['x']*scale+55),
+                         b.get('_py', b['y']*scale+18)) for b in blocks}
+    for b in blocks:
+        b.pop('_px',None); b.pop('_py',None)
+
+    conns, seen = [], set()
+    edges = cv2.Canny(gray, 50, 150)
+    lines = cv2.HoughLinesP(edges,1,3.14159/180,threshold=25,
+                             minLineLength=25,maxLineGap=12)
+    if lines is not None:
+        for ln in lines:
+            x1,y1,x2,y2 = ln[0]
+            sid = _nearest(x1,y1,centres,70)
+            did = _nearest(x2,y2,centres,70)
+            if not(sid and did and sid!=did): continue
+            if centres[sid][0] > centres[did][0]+5:
+                sid,did = did,sid
+            k = (sid,did)
             if k not in seen:
                 seen.add(k)
-                conns.append({
-                    'from': sid, 'to': did,
-                    'src_port': 1, 'dst_port': 1
-                })
+                dp = 1
+                dst = next((b for b in blocks if b['id']==did),None)
+                src = next((b for b in blocks if b['id']==sid),None)
+                if dst and dst['type']=='Sum' and src:
+                    dp = 1 if src['y'] <= dst['y'] else 2
+                conns.append({'from':sid,'to':did,'src_port':1,'dst_port':dp})
+
+    if not conns and len(blocks) > 1:
+        sb = sorted(blocks, key=lambda b: b['x'])
+        for i in range(len(sb)-1):
+            if abs(sb[i]['y']-sb[i+1]['y']) < 100:
+                k = (sb[i]['id'],sb[i+1]['id'])
+                if k not in seen:
+                    seen.add(k)
+                    conns.append({'from':sb[i]['id'],'to':sb[i+1]['id'],
+                                  'src_port':1,'dst_port':1})
     return conns
 
 
-def _nearest(px, py, centres, max_d):
-    best_id, best_d = None, max_d
-    for bid, (cx, cy) in centres.items():
-        d = ((px-cx)**2 + (py-cy)**2) ** 0.5
-        if d < best_d:
-            best_d, best_id = d, bid
+def _nearest(px,py,centres,md):
+    best_id,bd = None,md
+    for bid,(cx,cy) in centres.items():
+        d=((px-cx)**2+(py-cy)**2)**.5
+        if d<bd: bd,best_id=d,bid
     return best_id
 
-
-# ================================================================
-# Classification & Utilities
-# ================================================================
-
-def _classify(text, color_hint='unknown'):
-    tl   = text.lower().strip()
-    best, best_len = None, 0
-    for kw, btype in BLOCK_KEYWORDS.items():
-        if kw in tl and len(kw) > best_len:
-            best, best_len = btype, len(kw)
-    if best:
-        return best
-    color_map = {
-        'orange': 'SubSystem', 'cyan': 'Inport',
-        'yellow_green': 'Constant', 'green': 'Outport',
-    }
-    return color_map.get(color_hint, 'SubSystem')
-
-
-def _clean_name(text):
-    name = re.sub(r'[^\w\s]', '', text).strip()
-    name = re.sub(r'\s+', '_', name)
-    return name[:20] if name else ''
-
-
-def _extract_params(text, btype):
-    params = {}
-    nums = re.findall(r'[-\d.]+(?:e[-+]?\d+)?', text)
-    if btype == 'Gain' and nums:
-        params['Gain'] = nums[0]
-    elif btype == 'Constant' and nums:
-        params['Value'] = nums[0]
-    elif btype == 'Saturation' and len(nums) >= 2:
-        vals = sorted([float(n) for n in nums[:2]])
-        params['LowerLimit'] = str(vals[0])
-        params['UpperLimit'] = str(vals[1])
-    return params
+def _dedup(blocks):
+    kept=[]
+    for b in blocks:
+        px=b.get('_px',b['x']); py=b.get('_py',b['y'])
+        if not any(abs(px-k.get('_px',k['x']))<45 and
+                   abs(py-k.get('_py',k['y']))<35 for k in kept):
+            kept.append(b)
+    return kept
